@@ -3,10 +3,17 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import json
 import random
 import os
+import google.generativeai as genai  # Gemini API
+from functools import wraps
+import io
+import PyPDF2  # For reading PDF files
+import pandas as pd  # For reading Excel files
+from openpyxl import load_workbook  # Alternative for Excel files
+from collections import OrderedDict
 
 app = Flask(__name__)
 
@@ -20,21 +27,54 @@ app.config['JWT_SECRET_KEY'] = 'ashirwad'  # Change this to a secure secret key
 
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
+genai.configure(api_key="AIzaSyCyZPcCgke66CyRM_cgBu9EblT6aUbMKqA")
 
 
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, datetime):
-            return obj.strftime('%d/%m/%Y')  # Convert to DD/MM/YYYY
+            return obj.strftime('%d/%m/%Y %H:%M:%S')
+        if isinstance(obj, date):
+            return obj.strftime('%d/%m/%Y')
         return super().default(obj)
 
 app.json_encoder = CustomJSONEncoder  # Apply custom encoder
+
+
+# Add Role model
+class Role(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), unique=True, nullable=False)
+    description = db.Column(db.String(200))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+# Add AuditLog model
+class AuditLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, nullable=False)
+    action = db.Column(db.String(50), nullable=False)  # e.g., 'CREATE', 'UPDATE', 'DELETE'
+    table_name = db.Column(db.String(50), nullable=False)  # e.g., 'Style', 'Task'
+    record_id = db.Column(db.Integer, nullable=False)  # ID of the affected record
+    old_values = db.Column(db.JSON, nullable=True)  # Previous values
+    new_values = db.Column(db.JSON, nullable=True)  # New values
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    ip_address = db.Column(db.String(50), nullable=True)
 
 # ---------------- User Model ----------------
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password = db.Column(db.String(256), nullable=False)
+    role_id = db.Column(db.Integer, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime, nullable=True)
+    is_active = db.Column(db.Boolean, default=True)
+
+    def has_role(self, role_name):
+        return self.role.name == role_name
+
+    def is_admin(self):
+        return self.has_role('admin')
 
 # ---------------- Style Model ----------------
 class Style(db.Model):
@@ -90,9 +130,9 @@ class Task(db.Model):
     comment = db.Column(db.Text, nullable=True)
     problem_reported = db.Column(db.Boolean, default=False)
 
-    steps = db.relationship("TaskStep", backref="task", cascade="all, delete", lazy=True)
+    steps = db.relationship("TaskStep", backref="task", cascade="all, delete", lazy=True,order_by="TaskStep.id")
 
-# Task Step Model
+# Task Step Model 
 class TaskStep(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     task_id = db.Column(db.Integer, db.ForeignKey("task.id"), nullable=False)
@@ -161,6 +201,7 @@ class TrimVariant(db.Model):
     shade = db.Column(db.String(255))
     brand = db.Column(db.String(255))
     code = db.Column(db.String(255))
+    rate = db.Column(db.String(255))
 
 
 class Notification(db.Model):
@@ -205,14 +246,33 @@ def register():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
+    role_name = data.get('role', 'user')  # Default to 'user' role if not specified
 
     if User.query.filter_by(username=username).first():
         return jsonify({"message": "User already exists"}), 400
 
+    role = Role.query.filter_by(name=role_name).first()
+    if not role:
+        return jsonify({"message": "Invalid role"}), 400
+
     hashed_password = generate_password_hash(password)
-    new_user = User(username=username, password=hashed_password)
+    new_user = User(
+        username=username,
+        password=hashed_password,
+        role_id=role.id
+    )
     db.session.add(new_user)
     db.session.commit()
+
+    # Log the user creation
+    log_audit(
+        user_id=new_user.id,
+        action='CREATE',
+        table_name='User',
+        record_id=new_user.id,
+        new_values={'username': username, 'role': role_name},
+        ip_address=request.remote_addr
+    )
 
     return jsonify({"message": "User registered successfully"}), 201
 
@@ -227,8 +287,19 @@ def login():
     if not user or not check_password_hash(user.password, password):
         return jsonify({"message": "Invalid credentials"}), 401
 
+    if not user.is_active:
+        return jsonify({"message": "Account is deactivated"}), 403
+
+    # Update last login
+    user.last_login = datetime.utcnow()
+    db.session.commit()
+
     access_token = create_access_token(identity=user.id)
-    return jsonify({"access_token": access_token}), 200
+    return jsonify({
+        "access_token": access_token,
+        "role": user.role_id,
+        "username": user.username
+    }), 200
 
 # ---------------- Styles Routes (Using SQLAlchemy) ----------------
 @app.route('/styles', methods=['GET'])
@@ -279,8 +350,10 @@ def add_style():
     db.session.commit()
     # Add steps for the task
     steps = ["Start","Indent","PatternCutting","FabricCutting","Sewing","Embroidery","Finishing", "Problem"]
+    process_names = [item["process"] for item in PREDEFINED_PROCESSES]
+    process_names.append("Problem")
     # steps = ["start", "indent", "pattern", "fabric", "embroidery", "packing", "problem"]
-    for step in steps:
+    for step in process_names:
         db.session.add(TaskStep(task_id=new_task.id, step_name=step, is_completed=False))
     db.session.commit()
     if data.get("labDipsEnabled") == True:
@@ -298,6 +371,16 @@ def add_style():
 
 
     return jsonify({"message": "Style added successfully", "id": new_style.id}), 201
+
+@app.route('/styles/<int:style_id>', methods=['DELETE'])
+def delete_style(style_id):
+    style = Style.query.get(style_id)
+    if style:
+        db.session.delete(style)
+        db.session.commit()
+        return jsonify({'message': 'Style deleted successfully'}), 200
+    return jsonify({'error': 'Style not found'}), 404
+
 
 @app.route('/styles/<int:style_id>', methods=['PUT'])
 def update_style(style_id):
@@ -334,7 +417,10 @@ def update_style(style_id):
         # Add steps for the task
         steps = ["Start","Indent","PatternCutting","FabricCutting","Sewing","Embroidery","Finishing", "Problem"]
         # steps = ["start", "indent", "pattern", "fabric", "embroidery", "packing", "problem"]
-        for step in steps:
+        process_names = [item["process"] for item in PREDEFINED_PROCESSES]
+        process_names.append("Problem")
+
+        for step in process_names:
             db.session.add(TaskStep(task_id=new_task.id, step_name=step, is_completed=False))
         db.session.commit()
 
@@ -371,10 +457,10 @@ def get_activities():
             "style": act.style,
             "process": act.process,
             "duration": act.duration,
-            "plannedStart": act.planned_start.strftime("%Y-%m-%d") if act.planned_start else None,
-            "plannedEnd": act.planned_end.strftime("%Y-%m-%d") if act.planned_end else None,
-            "actualStart": act.actual_start.strftime("%Y-%m-%d") if act.actual_start else None,
-            "actualEnd": act.actual_end.strftime("%Y-%m-%d") if act.actual_end else None,
+            "plannedStart": act.planned_start,
+            "plannedEnd": act.planned_end,
+            "actualStart": act.actual_start,
+            "actualEnd": act.actual_end,
             "actualDuration": act.actual_duration,
             "delay": act.delay,
             "responsibility": act.responsibility
@@ -504,8 +590,9 @@ def add_task():
     # Add steps for the task
     # steps = ["start", "indent", "pattern", "fabric", "embroidery", "packing", "problem"]
     steps = ["Start","Indent","PatternCutting","FabricCutting","Sewing","Embroidery","Finishing", "Problem"]
-
-    for step in steps:
+    process_names = [item["process"] for item in PREDEFINED_PROCESSES]
+    process_names.append("Problem")
+    for step in process_names:
         db.session.add(TaskStep(task_id=new_task.id, step_name=step, is_completed=False))
     db.session.commit()
 
@@ -517,6 +604,7 @@ def get_tasks():
     tasks = Task.query.all()
     task_list = []
     for task in tasks:
+        ordered_steps = sorted(task.steps, key=lambda s: s.id)
         task_list.append({
             "id": task.id,
             "styleNumber": task.style_number,
@@ -529,8 +617,12 @@ def get_tasks():
             "timestamp": task.timestamp,
             "comment": task.comment,
             "problemReported": task.problem_reported,
-            "steps": {step.step_name: step.is_completed for step in task.steps}
+            "steps":  [
+                {"step_name": step.step_name, "is_completed": step.is_completed}
+                for step in ordered_steps
+            ]
         })
+    app.logger.info(task_list)
     return jsonify(task_list)
 
 # Get a single task
@@ -539,7 +631,7 @@ def get_task(task_id):
     task = Task.query.get(task_id)
     if not task:
         return jsonify({"error": "Task not found"}), 404
-
+    ordered_steps = sorted(task.steps, key=lambda s: s.id)
     task_data = {
         "id": task.id,
         "styleNumber": task.style_number,
@@ -552,7 +644,7 @@ def get_task(task_id):
         "timestamp": task.timestamp,
         "comment": task.comment,
         "problemReported": task.problem_reported,
-        "steps": {step.step_name: step.is_completed for step in task.steps},
+        "steps": {step.step_name: step.is_completed for step in ordered_steps},
     }
     return jsonify(task_data)
 
@@ -575,10 +667,10 @@ def update_task(task_id):
 
     # Update steps
     if "steps" in data:
-        for step_name, is_completed in data["steps"].items():
-            step = TaskStep.query.filter_by(task_id=task_id, step_name=step_name).first()
+        for item  in data["steps"]:
+            step = TaskStep.query.filter_by(task_id=task_id, step_name=item["step_name"]).first()
             if step:
-                step.is_completed = is_completed
+                step.is_completed = item["is_completed"]
 
     db.session.commit()
     if "status" in data and data["status"] == "completed":
@@ -695,10 +787,10 @@ def update_order():
     db.session.commit()
     if order.type=="Sent from Factory":
         courier = Courier.query.filter_by(id=order.courier_id).first()
-        style = Style.query.filter_by(style_number=courier.style_number)
-        style.approval_status = "pending"
-        db.session.add(style)
-        db.session.commit()
+        style = Style.query.filter_by(style_number=courier.style_number).first()
+        if style:
+            style.approval_status = "pending"
+            db.session.commit()
 
     return jsonify({
         'message': 'Order updated successfully',
@@ -785,7 +877,7 @@ def upload_files():
             uploaded_files[file_key] = file_path
 
     # If a Techpack file was uploaded, create a new Style entry
-    if "techpack" in uploaded_files:
+    if "techpack" and "bom" in uploaded_files:
         new_style = Style(
             style_number="EBOLT-S-05",
             brand=buyer_name,
@@ -795,7 +887,7 @@ def upload_files():
             quantity="2",
             smv="42",
             order_received_date=datetime.today(),
-            techpack_data = generateTechPackData()
+            techpack_data = generateTechPackDataFromAi()
         )
         db.session.add(new_style)
         db.session.commit()
@@ -814,6 +906,68 @@ def upload_files():
 
 
     return jsonify({"message": "Files uploaded successfully!", "files": uploaded_files})
+
+@app.route("/upload_files_new", methods=["POST"])
+def upload_files_new():
+    buyer_name = request.form.get("buyerName")
+    garment = request.form.get("garment")
+    
+    if not buyer_name or not garment:
+        return jsonify({"message": "Buyer Name and Garment are required!"}), 400
+    
+    uploaded_files = {}
+    for file_key in ["techpack", "bom", "specSheet"]:
+        if file_key in request.files:
+            file = request.files[file_key]
+            if file.filename:  # Check if file is actually selected
+                # Add file type indicator in the filename
+                file_path = os.path.join(
+                    app.config["UPLOAD_FOLDER"], 
+                    f"{buyer_name}_{garment}_{file_key}_{file.filename}"
+                )
+                file.save(file_path)
+                uploaded_files[file_key] = file_path
+    
+    # If at least Techpack and BOM files were uploaded, create a new Style entry
+    if "techpack" in uploaded_files and "bom" in uploaded_files:
+        # Generate style metadata and techpack data using AI
+        ai_result = generateTechPackDataFromAi(buyer_name,garment)
+        style_metadata = ai_result.get("style_metadata", {})
+        techpack_data = ai_result.get("techpack_data", {})
+        
+        # Create new style with the AI-generated data
+        # Use AI-extracted values with fallbacks to form values or defaults
+        new_style = Style(
+            style_number=style_metadata.get("style_number") or "EBOLT-S-05",
+            brand=style_metadata.get("brand") or buyer_name,
+            sample_type=style_metadata.get("sample_type") or "Fit Sample",
+            garment=style_metadata.get("garment") or garment,
+            color=style_metadata.get("color") or techpack_data.get("shade") or "Ivory",
+            quantity=style_metadata.get("quantity") or "2",
+            smv=style_metadata.get("smv") or "42",
+            order_received_date=datetime.today(),
+            techpack_data=techpack_data
+        )
+        
+        db.session.add(new_style)
+        db.session.commit()
+        
+        return jsonify({
+            "message": "Files uploaded and style created successfully!",
+            "files": uploaded_files,
+            "style": {
+                "id": new_style.id,
+                "style_number": new_style.style_number,
+                "brand": new_style.brand,
+                "garment": new_style.garment,
+                "color": new_style.color
+            }
+        })
+    
+    return jsonify({
+        "message": "Files uploaded successfully! No style created (requires techpack and BOM).", 
+        "files": uploaded_files
+    })
 
 def generateTechPackData():
          new_techpack_data = {
@@ -1010,7 +1164,8 @@ def get_trim(trim_name):
             "structure": variant.structure,
             "shade": variant.shade,
             "brand": variant.brand,
-            "code" : variant.code
+            "code" : variant.code,
+            "rate" : variant.rate
         }
         for variant in trimVariants
     ]
@@ -1039,21 +1194,24 @@ def add_trim():
         structure=data.get('structure', ''),
         shade=data.get('shade', ''),
         brand=data.get('brand', ''),
-        code=data.get('code', '')
+        code=data.get('code', ''),
+        rate =data.get('rate','')
     )
     db.session.add(new_trim)
     db.session.commit()
     return jsonify({'message': 'Trim added successfully'}), 201
 
 # Delete a trim
-@app.route('/api/trims/<string:trim_name>', methods=['DELETE'])
-def delete_trim(trim_name):
-    trim = Trim.query.filter_by(name=trim_name).first()
-    if not trim:
-        return jsonify({'error': 'Trim not found'}), 404
-    db.session.delete(trim)
+@app.route('/api/variants/<int:variant_id>', methods=['DELETE'])
+def delete_variant(variant_id):
+    variant = TrimVariant.query.get(variant_id)
+    if not variant:
+        return jsonify({'error': 'Variant not found'}), 404
+
+    db.session.delete(variant)
     db.session.commit()
-    return jsonify({'message': 'Trim deleted successfully'})
+    return jsonify({'message': 'Variant deleted successfully'})
+
 
 # Update a trim
 @app.route('/api/trims/<string:trim_name>', methods=['PUT'])
@@ -1069,6 +1227,7 @@ def update_trim(trim_name):
     trim.shade = data.get('shade', trim.shade)
     trim.brand = data.get('brand', trim.brand)
     trim.code = data.get('code', trim.code)
+    trim.rate = data.get('rate',trim.rate)
 
     db.session.commit()
     return jsonify({'message': 'Trim updated successfully'})
@@ -1092,6 +1251,7 @@ def add_trim_variant(trim_id):
     shade = data.get("shade")
     brand = data.get("brand")
     code = data.get("code")
+    rate = data.get("rate",'')
 
 
     if not image or not composition or not structure or not shade or not brand:
@@ -1104,7 +1264,8 @@ def add_trim_variant(trim_id):
         structure=structure,
         shade=shade,
         brand=brand,
-        code = code
+        code = code,
+        rate = rate
     )
 
     db.session.add(new_variant)
@@ -1153,6 +1314,682 @@ def delete_notification(id):
     db.session.commit()
     return jsonify({"message": "Notification deleted successfully"})
 
+
+def query_gemini(prompt):
+    """Send a query to Gemini and return the response."""
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    response = model.generate_content(prompt)
+    return response.text
+
+def generate_ai_response(query, data):
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    # Use the custom encoder for JSON serialization
+    json_data = json.dumps(data, indent=2, cls=CustomJSONEncoder)
+    prompt = f"User Query: {query}\n\nRelevant Data: {json_data}\n\nProvide a helpful response."
+    response = model.generate_content(prompt)
+    return response.text.strip()
+
+
+def generateTechPackDataFromAi(buyer_name,garment):
+    """
+    Process uploaded techpack and BOM files using Google's Gemini LLM
+    to extract and structure the techpack data along with style details.
+    Returns both style metadata and techpack technical data.
+    """
+
+    # Get the current request's files from upload folder
+    upload_folder = app.config["UPLOAD_FOLDER"] # Make sure 'app' is defined in this scope
+    
+    # Find the most recently uploaded techpack and BOM files
+    files = {}
+    for filename in os.listdir(upload_folder):
+        if "_techpack_" in filename.lower() and os.path.isfile(os.path.join(upload_folder, filename)):
+            files["techpack"] = os.path.join(upload_folder, filename)
+        elif "_bom_" in filename.lower() and os.path.isfile(os.path.join(upload_folder, filename)):
+            files["bom"] = os.path.join(upload_folder, filename)
+        elif "_specSheet_" in filename.lower() and os.path.isfile(os.path.join(upload_folder, filename)):
+            files["specSheet"] = os.path.join(upload_folder, filename)
+    trims_data = db.session.query(Trim.name, TrimVariant).join(TrimVariant, Trim.id == TrimVariant.trim_id).all()
+
+    # Read the file contents based on file type
+    file_contents = {}
+    for file_type, file_path in files.items():
+        try:
+            file_extension = os.path.splitext(file_path)[1].lower()
+            
+            # Handle PDF files
+            if file_extension == '.pdf':
+                pdf_text = extract_text_from_pdf(file_path) # Make sure this function is defined
+                file_contents[file_type] = pdf_text
+            
+            # Handle Excel files (xlsx, xls)
+            elif file_extension in ['.xlsx', '.xls']:
+                excel_text = extract_text_from_excel(file_path) # Make sure this function is defined
+                file_contents[file_type] = excel_text
+            
+            # Handle text files (txt, csv, etc.)
+            else:
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    file_contents[file_type] = file.read()
+                    
+        except Exception as e:
+            # app.logger.error(f"Error reading {file_type} file: {e}") # Make sure 'app.logger' is available
+            print(f"Error reading {file_type} file: {e}") # Using print for standalone example
+            file_contents[file_type] = f"Error reading file: {e}"
+    
+    # Create prompt for the LLM
+    # MODIFIED PROMPT: Escaped curly braces for the JSON example
+    prompt = '''
+    Analyze the provided techpack, BOM (Bill of Materials),trims data, and extract the following information in a structured JSON format:
+    
+    1. Style information: style_number, brand, sample_type, garment type, color, quantity, smv (Standard Minute Value, if no smv present mark it as 42)
+    2. Basic product information: shade, patternNo, season, mainBodyFabric, collarFabric, mainLabel, threadShade, sewingThreads, sewingThreadsDetails
+    3. Cost sheet information with fabric costs and trim costs
+    4. BOM (Bill of Materials) information including fabrics and trims
+    Extract trims data from BOM and populate the respective fields in the JSON, if code matches for a specific trim add the cost for it also.
+    Populate the same data as BOM in trim cost maintaing the format for both the keys.
+    While extracting label trims only extract the Main Label and Size Label trims, for trims that are a label extract only one of each. Extract for the size mentioned in the techpack. 
+    Format the response exactly like this example:
+    {{  
+        "style_metadata": {{
+            "style_number": "EBOLT-S-05",
+            "brand": "BrandName",
+            "sample_type": "Fit Sample",
+            "garment": "Polo Shirt",
+            "color": "Ivory",
+            "quantity": "2",
+            "smv": "42"
+        }},
+        "techpack_data": {{
+            "shade": "Ivory",
+            "patternNo": "290638",
+            "season": "SS25",
+            "mainBodyFabric": "Jersey Waffle 100% Cotton",
+            "collarFabric": "",
+            "mainLabel": "EA02A00319CH - WHITE/BLUE",
+            "threadShade": "BLACK, TKT120",
+            "sewingThreads": "STIPBPLAHUB1019, STILASATHUB2424",
+            "sewingThreadsDetails": "POLY POLY-2994-EPIC-Tex 24 - TKT 120, POLY POLY-2994-EPIC-Tex 18 - TKT 180",
+            "costSheet": {{
+                "fabricCost": [
+                    {{
+                        "fabricType": "Shell Fabric",
+                        "description": "Jersey Waffle 100% Cotton"
+                    }}
+                ],
+                "trimCost": [
+                    {{
+                        "trim": "BUTTON",
+                        "description": "20134935 - 4 Holes - Gritt",
+                        "quantity": "3"
+                    }},
+                    {{
+                        "trim": "Interlining",
+                        "description": "Fusible interlining 9510",
+                        "quantity": "66"
+                    }}
+                    // other trim costs...
+                ]
+            }},
+            "bom": {{
+                "fabric": [
+                    {{
+                        "code": "",
+                        "description": "Jersey Waffle 100% Cotton",
+                        "color": "Ivory",
+                        "size": "M",
+                        "quantity": "1"
+                    }}
+                ],
+                "trims": [
+                    {{
+                        "code": "STIINCOTGEN5877",
+                        "trim": "Interlining",
+                        "description": "Fusible interlining 9510",
+                        "color": "9510 COL.3216 BLACK",
+                        "size": "M",
+                        "quantity": "66.00"
+                    }}
+                    // other trims...
+                ]
+            }}
+        }}
+    }}
+    
+    If any information is not available in the provided documents, make an educated guess based on the available data or leave it as an empty string.
+    
+    Return ONLY the JSON with no explanations or additional text.
+    
+    Techpack data:
+    {0}
+    
+    BOM data:
+    {1}
+    Trims data:
+    {2}
+    If you are unable to fetch buyer name from provided data use this: {3}
+    If you are unable to extract garment type from provided data user this : {4}
+    ''' # You could add {2} here if you plan to include specSheet_data in the format call
+    
+    # Format the prompt with the file contents
+    formatted_prompt = prompt.format(
+        file_contents.get("techpack", "No techpack file found"),
+        file_contents.get("bom", "No BOM file found"),
+        trims_data,
+        buyer_name,
+        garment
+        # If you want to include specSheet data, uncomment the line below
+        # and add a {2} placeholder in the prompt string.
+        # file_contents.get("specSheet", "No spec sheet found") 
+    )
+    
+    try:
+        # Generate response using Gemini
+        model = genai.GenerativeModel("gemini-2.0-flash") # Ensure genai is imported and configured
+        response = model.generate_content(formatted_prompt)
+        response_text = response.text.strip().removeprefix("```json").removesuffix('```')
+        app.logger.info(response_text)
+        # For testing without API call, using the example JSON structure
+        # response_text = """
+        # {
+        #     "style_metadata": {
+        #         "style_number": "EBOLT-S-05",
+        #         "brand": "BrandName",
+        #         "sample_type": "Fit Sample",
+        #         "garment": "Polo Shirt",
+        #         "color": "Ivory",
+        #         "quantity": "2",
+        #         "smv": "42"
+        #     },
+        #     "techpack_data": {
+        #         "shade": "Ivory",
+        #         "patternNo": "290638",
+        #         "season": "SS25",
+        #         "mainBodyFabric": "Jersey Waffle 100% Cotton",
+        #         "collarFabric": "",
+        #         "mainLabel": "EA02A00319CH - WHITE/BLUE",
+        #         "threadShade": "BLACK, TKT120",
+        #         "sewingThreads": "STIPBPLAHUB1019, STILASATHUB2424",
+        #         "sewingThreadsDetails": "POLY POLY-2994-EPIC-Tex 24 - TKT 120, POLY POLY-2994-EPIC-Tex 18 - TKT 180",
+        #         "costSheet": {
+        #             "fabricCost": [
+        #                 {
+        #                     "fabricType": "Shell Fabric",
+        #                     "description": "Jersey Waffle 100% Cotton"
+        #                 }
+        #             ],
+        #             "trimCost": [
+        #                 {
+        #                     "trim": "BUTTON",
+        #                     "descirption": "20134935 - 4 Holes - Gritt",
+        #                     "quantity": "3"
+        #                 },
+        #                 {
+        #                     "trim": "Interlining",
+        #                     "descirption": "Fusible interlining 9510",
+        #                     "quantity": "66"
+        #                 }
+        #             ]
+        #         },
+        #         "bom": {
+        #             "fabric": [
+        #                 {
+        #                     "code": "",
+        #                     "description": "Jersey Waffle 100% Cotton",
+        #                     "color": "Ivory",
+        #                     "size": "M",
+        #                     "quantity": "1"
+        #                 }
+        #             ],
+        #             "trims": [
+        #                 {
+        #                     "code": "STIINCOTGEN5877",
+        #                     "trim": "Interlining",
+        #                     "descirption": "Fusible interlining 9510",
+        #                     "color": "9510 COL.3216 BLACK",
+        #                     "size": "M",
+        #                     "quantity": "66.00"
+        #                 }
+        #             ]
+        #         }
+        #     }
+        # }
+        # """
+        # response_text = response_text.strip()
+
+        # Ensure response is valid JSON
+        try:
+            full_data = json.loads(response_text) # Ensure json is imported
+            
+            # Extract style metadata and techpack data
+            style_metadata = full_data.get("style_metadata", {})
+            techpack_data = full_data.get("techpack_data", {})
+            
+            # Fix any common formatting issues in techpack data
+            if "sewingThreads" in techpack_data:
+                # Typo was sweingThreads, should be sewingThreads
+                # techpack_data["sweingThreads"] = techpack_data.pop("sewingThreads") 
+                pass # Keeping as sewingThreads if model returns it correctly
+            if "sewingThreadsDetails" in techpack_data:
+                # Typo was sweingThreadsDetails, should be sewingThreadsDetails
+                # techpack_data["sweingThreadsDetails"] = techpack_data.pop("sewingThreadsDetails")
+                pass # Keeping as sewingThreadsDetails if model returns it correctly
+                
+            # Fix any 'description' that was spelled as 'descirption'
+            if "costSheet" in techpack_data and "trimCost" in techpack_data["costSheet"]:
+                for item in techpack_data["costSheet"]["trimCost"]:
+                    if "descirption" in item:
+                        item["description"] = item.pop("descirption")
+            
+            if "bom" in techpack_data and "trims" in techpack_data["bom"]:
+                for item in techpack_data["bom"]["trims"]:
+                    if "descirption" in item:
+                        item["description"] = item.pop("descirption")
+            
+            # Combine metadata and technical data
+            result = {
+                "style_metadata": style_metadata,
+                "techpack_data": techpack_data
+            }
+            
+            return result
+            
+        except json.JSONDecodeError:
+            # app.logger.error("AI response was not valid JSON")
+            print("AI response was not valid JSON")
+            # Return a minimal valid structure if parsing fails
+            return {
+                "style_metadata": {
+                    "style_number": "", "brand": "", "sample_type": "Fit Sample", 
+                    "garment": "", "color": "", "quantity": "1", "smv": ""
+                },
+                "techpack_data": {
+                    "shade": "", "patternNo": "", "season": "", "mainBodyFabric": "",
+                    "collarFabric": "", "mainLabel": "", "threadShade": "",
+                    "sewingThreads": "", "sewingThreadsDetails": "", # Corrected typo
+                    "costSheet": {"fabricCost": [], "trimCost": []},
+                    "bom": {"fabric": [], "trims": []}
+                }
+            }
+    
+    except Exception as e:
+        # app.logger.error(f"Error generating techpack data with AI: {e}")
+        print(f"Error generating techpack data with AI: {e}")
+        # Return a minimal valid structure if AI processing fails
+        return {
+            "style_metadata": {
+                "style_number": "", "brand": "", "sample_type": "Fit Sample", 
+                "garment": "", "color": "", "quantity": "1", "smv": ""
+            },
+            "techpack_data": {
+                "shade": "", "patternNo": "", "season": "", "mainBodyFabric": "",
+                "collarFabric": "", "mainLabel": "", "threadShade": "",
+                "sewingThreads": "", "sewingThreadsDetails": "", # Corrected typo
+                "costSheet": {"fabricCost": [], "trimCost": []},
+                "bom": {"fabric": [], "trims": []}
+            }
+        }
+
+def extract_text_from_pdf(pdf_path):
+    """
+    Extract text content from a PDF file
+    """
+    text = ""
+    try:
+        # Open the PDF file in binary mode
+        with open(pdf_path, 'rb') as file:
+            # Create a PDF reader object
+            pdf_reader = PyPDF2.PdfReader(file)
+            
+            # Extract text from each page
+            for page_num in range(len(pdf_reader.pages)):
+                page = pdf_reader.pages[page_num]
+                text += page.extract_text() + "\n\n"
+    except Exception as e:
+        text = f"Error extracting text from PDF: {str(e)}"
+    
+    return text
+
+def extract_text_from_excel(excel_path):
+    """
+    Extract text content from an Excel file (xlsx or xls)
+    """
+    text = ""
+    try:
+        # Try using pandas first, which is generally more robust
+        try:
+            # Read all sheets
+            xls = pd.ExcelFile(excel_path)
+            sheet_names = xls.sheet_names
+            
+            for sheet_name in sheet_names:
+                df = pd.read_excel(excel_path, sheet_name=sheet_name)
+                text += f"Sheet: {sheet_name}\n"
+                text += df.to_string(index=False) + "\n\n"
+        
+        # If pandas fails, try openpyxl as a backup
+        except:
+            workbook = load_workbook(filename=excel_path, read_only=True, data_only=True)
+            
+            for sheet_name in workbook.sheetnames:
+                sheet = workbook[sheet_name]
+                text += f"Sheet: {sheet_name}\n"
+                
+                for row in sheet.rows:
+                    row_text = " | ".join([str(cell.value) if cell.value is not None else "" for cell in row])
+                    text += row_text + "\n"
+                text += "\n"
+    
+    except Exception as e:
+        text = f"Error extracting text from Excel: {str(e)}"
+    
+    return text
+
+@app.route('/api/activity/update', methods=['POST'])
+def update_activity_from_progress():
+    data = request.json
+    style = data.get('style')
+    process = data.get('process')
+    is_checked = data.get('isChecked')
+    next_process = data.get('nextProcess')
+    
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Find the activity record for the current process
+    activity = Activity.query.filter_by(style=style, process=process).first()
+    
+    if not activity:
+        return jsonify({"error": f"No activity found for style {style} and process {process}"}), 404
+    
+    if is_checked:
+        # Update the actual_end time for the current process
+        activity.actual_end = current_time
+        
+        # Calculate actual duration if actual_start exists
+        if activity.actual_start:
+            actual_start_time = datetime.strptime(activity.actual_start, '%Y-%m-%d %H:%M:%S')
+            actual_end_time = datetime.strptime(current_time, '%Y-%m-%d %H:%M:%S')
+            activity.actual_duration = (actual_end_time - actual_start_time).total_seconds() / 3600  # Convert to hours
+            
+            # Calculate delay if planned_end exists
+            if activity.planned_end:
+                planned_end_time = datetime.strptime(activity.planned_end, '%Y-%m-%d %H:%M:%S')
+                activity.delay = (actual_end_time - planned_end_time).total_seconds() / 3600  # Convert to hours
+        
+        # If there's a next process, update its actual_start time
+        if next_process:
+            next_activity = Activity.query.filter_by(style=style, process=next_process).first()
+            if next_activity:
+                next_activity.actual_start = current_time
+                db.session.add(next_activity)
+    else:
+        # If checkbox is unchecked, clear the actual_end time
+        activity.actual_end = None
+        activity.actual_duration = None
+        activity.delay = None
+        
+        # Also clear the actual_start time of the next process
+        if next_process:
+            next_activity = Activity.query.filter_by(style=style, process=next_process).first()
+            if next_activity:
+                next_activity.actual_start = None
+                db.session.add(next_activity)
+    
+    db.session.add(activity)
+    db.session.commit()
+    
+    return jsonify({"message": "Activity updated successfully"}), 200
+
+@app.route('/api/activity/<style>', methods=['GET'])
+def get_activities_from_progress(style):
+    activities = Activity.query.filter_by(style=style).all()
+    
+    result = []
+    for activity in activities:
+        result.append({
+            'id': activity.id,
+            'style': activity.style,
+            'process': activity.process,
+            'duration': activity.duration,
+            'planned_start': activity.planned_start,
+            'planned_end': activity.planned_end,
+            'actual_start': activity.actual_start,
+            'actual_end': activity.actual_end,
+            'actual_duration': activity.actual_duration,
+            'delay': activity.delay,
+            'responsibility': activity.responsibility
+        })
+    
+    return jsonify(result), 200
+
+@app.route('/api/activity/create', methods=['POST'])
+def create_activities_from_progress():
+    data = request.json
+    style = data.get('style')
+    processes = data.get('processes')
+    
+    if not style or not processes:
+        return jsonify({"error": "Style and processes are required"}), 400
+    
+    # Default values for new activities
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    created_activities = []
+    
+    for i, process in enumerate(processes):
+        # Calculate planned times based on sequence
+        planned_start = current_time  # Default start time
+        
+        # Simple logic to stagger planned times - adjust as needed
+        if i > 0:
+            previous_planned_end = datetime.strptime(planned_start, '%Y-%m-%d %H:%M:%S')
+            planned_start = (previous_planned_end + datetime.timedelta(hours=2)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        planned_end = (datetime.strptime(planned_start, '%Y-%m-%d %H:%M:%S') + 
+                      datetime.timedelta(hours=4)).strftime('%Y-%m-%d %H:%M:%S')  # Default 4 hours per process
+        
+        # Create the activity record
+        activity = Activity(
+            style=style,
+            process=process,
+            duration=4.0,  # Default 4 hours duration
+            planned_start=planned_start,
+            planned_end=planned_end,
+            responsibility="Production Team"  # Default responsibility
+        )
+        
+        db.session.add(activity)
+        
+        created_activities.append({
+            'style': style,
+            'process': process,
+            'planned_start': planned_start,
+            'planned_end': planned_end
+        })
+    
+    db.session.commit()
+    
+    return jsonify({
+        "message": f"Created {len(created_activities)} activity records for style {style}",
+        "activities": created_activities
+    }), 201
+
+
+@app.route('/chatbot/query', methods=['POST'])
+def chatbot_query():
+    data = request.json
+    user_query = data.get("query", "").lower()
+
+    response = "Sorry, I couldn't understand your query."
+
+    # 1️⃣ Order Status
+    if "status of style" in user_query or "order status" in user_query:
+        style_no = user_query.split()[-1]  # Extract style number
+        style_info  = Style.query.filter_by(style_number = style_no).first()
+        task_info = Task.query.filter_by(style_number = style_no).first()
+        activities_info = Activity.query.filter_by(style=style_no)
+        response = get_response_string_from_style_info(style_info, task_info, activities_info)
+
+    # 3️⃣ TNA Activity
+    elif "activity status" in user_query:
+        activities = Activity.query.filter(Activity.status != 'Completed').all()
+        response = [{"Process": a.process, "Status": a.status} for a in activities]
+
+    # 5️⃣ If no predefined query is matched, use Gemini for AI-generated responses
+    elif "expected delivery date" in user_query:
+        style_no = user_query.split()[-1]  # Extract style number
+        style_info  = Style.query.filter_by(style_number = style_no).first()
+        response = f"Expected Delivery Date for Style {style_info.style_number} is {style_info.order_delivery_date}"
+
+    # elif "bom" or "bill of material" or "cost sheet" in user_query:
+    #     style_no = user_query.split()[-1]  # Extract style number
+    #     style_info  = Style.query.filter_by(style_number = style_no).first()
+    #     techpack_data = style_info.techpack_data
+    #     response = generate_ai_response(user_query, techpack_data)
+
+    else:
+        style_data = get_style_data_for_gemini(user_query)
+        if style_data is not None:
+            response =  generate_ai_response(f"User asked: {user_query}",style_data)
+        else:
+            response = "Sorry, I couldn't understand your query."
+
+    return jsonify({"response": response})
+
+def get_style_data_for_gemini(user_query):
+    style_no = user_query.split()[-1]  # Extract style number
+    style_info = Style.query.filter_by(style_number=style_no).first()
+    
+    # Convert style data to dictionary with date handling
+    style_data = {}
+    if style_info:
+        style_data = {
+            "id": style_info.id,
+            "style": style_info.style_number,
+            "buyer": style_info.brand,
+            "garment": style_info.garment,
+            "date": style_info.order_received_date.strftime('%d/%m/%Y') if style_info.order_received_date else None,
+            "approvalStatus": style_info.approval_status,
+            "order_delivery_date": style_info.order_delivery_date.strftime('%d/%m/%Y') if style_info.order_delivery_date else None,
+            "techpack_data": style_info.techpack_data
+        }
+    else:
+        return None
+    # Convert activity data to list of dictionaries
+    activity_data = Activity.query.filter_by(style=style_no).all()
+    activity_list = [{
+        "id": act.id,
+        "style": act.style,
+        "process": act.process,
+        "duration": act.duration,
+        "planned_start": act.planned_start,
+        "planned_end": act.planned_end,
+        "actual_start": act.actual_start,
+        "actual_end": act.actual_end,
+        "actual_duration": act.actual_duration,
+        "delay": act.delay,
+        "responsibility": act.responsibility
+    } for act in activity_data]
+    
+    # Convert task data to list of dictionaries
+    task_data = Task.query.filter_by(style_number=style_no).all()
+    task_list = [{
+        "id": task.id,
+        "style_number": task.style_number,
+        "brand": task.brand,
+        "sample_type": task.sample_type,
+        "garment": task.garment,
+        "status": task.status,
+        "progress": task.progress,
+        "priority": task.priority,
+        "timestamp": task.timestamp.strftime("%Y-%m-%d %H:%M:%S") if task.timestamp else None,
+        "comment": task.comment,
+        "problem_reported": task.problem_reported
+    } for task in task_data]
+    
+    return {
+        "style_data": style_data,
+        "activity_data": activity_list,
+        "task_data": task_list
+    }
+
+def get_response_string_from_style_info(style_info, task_info, activity_info : Activity):
+    current_activity = None 
+    for activity in activity_info:
+        if activity.actual_end is None:
+            current_activity = activity
+            break
+
+    return f"Style Number : {style_info.style_number} \n Brand: {style_info.brand} \n Task Status: {task_info.status} \n Activity Status: {current_activity.process}"
+
+# Role-based access control decorators
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        if not user or not user.is_admin():
+            return jsonify({"error": "Admin access required"}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+def role_required(role_name):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            current_user_id = get_jwt_identity()
+            user = User.query.get(current_user_id)
+            if not user or not user.has_role(role_name):
+                return jsonify({"error": f"{role_name} access required"}), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+# Audit logging function
+def log_audit(user_id, action, table_name, record_id, old_values=None, new_values=None, ip_address=None):
+    audit_log = AuditLog(
+        user_id=user_id,
+        action=action,
+        table_name=table_name,
+        record_id=record_id,
+        old_values=old_values,
+        new_values=new_values,
+        ip_address=ip_address
+    )
+    db.session.add(audit_log)
+    db.session.commit()
+
+# Add endpoint to get audit logs (admin only)
+@app.route('/api/audit-logs', methods=['GET'])
+@jwt_required()
+@admin_required
+def get_audit_logs():
+    logs = AuditLog.query.order_by(AuditLog.timestamp.desc()).all()
+    return jsonify([{
+        'id': log.id,
+        'user_id': log.user_id,
+        'action': log.action,
+        'table_name': log.table_name,
+        'record_id': log.record_id,
+        'old_values': log.old_values,
+        'new_values': log.new_values,
+        'timestamp': log.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+        'ip_address': log.ip_address
+    } for log in logs])
+
+# Initialize roles if they don't exist
+def initialize_roles():
+    roles = ['admin', 'manager', 'user']
+    for role_name in roles:
+        if not Role.query.filter_by(name=role_name).first():
+            role = Role(name=role_name, description=f'{role_name.capitalize()} role')
+            db.session.add(role)
+    db.session.commit()
+
+# Call initialize_roles when the application starts
+with app.app_context():
+    db.create_all()
+    initialize_roles()
 
 if __name__ == '__main__':
     if not os.path.exists(app.config["UPLOAD_FOLDER"]):
