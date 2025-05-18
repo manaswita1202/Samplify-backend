@@ -3,7 +3,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 import json
 import random
 import os
@@ -14,6 +14,8 @@ import PyPDF2  # For reading PDF files
 import pandas as pd  # For reading Excel files
 from openpyxl import load_workbook  # Alternative for Excel files
 from collections import OrderedDict
+import base64
+from PIL import Image
 
 app = Flask(__name__)
 
@@ -89,7 +91,7 @@ class Style(db.Model):
     buyer_approval = db.Column(db.Boolean, nullable=True)
     order_received_date = db.Column(db.Date, nullable=True)
     order_delivery_date = db.Column(db.Date, nullable=True)
-    approval_status = db.Column(db.Enum("received", "pending", "yetToSend","queued"), default="queued")
+    approval_status = db.Column(db.Enum("received", "pending", "yetToSend","queued","rejected"), default="queued")
     lab_dips_enabled = db.Column(db.Boolean, nullable=True)
     techpack_data = db.Column(db.JSON, nullable=True)  # JSON column added
 
@@ -218,6 +220,78 @@ class Notification(db.Model):
             "read_status": self.read_status
         }
 
+class SampleTrackerStyle(db.Model):
+    __tablename__ = 'sample_tracker_style'
+    id = db.Column(db.Integer, primary_key=True)
+    style_number = db.Column(db.String(100), nullable=False)
+    brand = db.Column(db.String(100), nullable=False)
+    garment_type = db.Column(db.String(100), nullable=False)
+    start_date = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    end_date = db.Column(db.DateTime, nullable=True)
+    # Relationship: A style has many samples. Cascade delete means if a style is deleted, its samples are too.
+    samples = db.relationship('SampleTrackerSample', backref='style', lazy=True, cascade="all, delete-orphan")
+
+    def to_dict(self, include_samples=True):
+        data = {
+            "id": self.id,
+            "styleNumber": self.style_number,
+            "brand": self.brand,
+            "garmentType": self.garment_type,
+            "startDate": self.start_date.isoformat() if self.start_date else None,
+            "endDate": self.end_date.isoformat() if self.end_date else None,
+        }
+        if include_samples:
+            # Sort samples by their ID to maintain a somewhat consistent order, or by another field if needed
+            data["samples"] = sorted([sample.to_dict() for sample in self.samples], key=lambda s: s['id'])
+        return data
+
+class SampleTrackerSample(db.Model):
+    __tablename__ = 'sample_tracker_sample'
+    id = db.Column(db.Integer, primary_key=True) # Unique ID for each sample
+    style_id = db.Column(db.Integer, db.ForeignKey('sample_tracker_style.id'), nullable=False)
+    type = db.Column(db.String(100), nullable=False)
+    completed = db.Column(db.Boolean, default=False)
+    start_date = db.Column(db.DateTime, nullable=True)
+    end_date = db.Column(db.DateTime, nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "styleId": self.style_id, # Optional: useful for context
+            "type": self.type,
+            "completed": self.completed,
+            "startDate": self.start_date.isoformat() if self.start_date else None,
+            "endDate": self.end_date.isoformat() if self.end_date else None
+        }
+
+# New Fabric models
+class Fabric(db.Model):
+    __tablename__ = 'fabrics'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False, unique=True)
+    image = db.Column(db.String(255), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # Relationship with variants
+    variants = db.relationship('FabricVariant', backref='fabric', lazy=True, cascade='all, delete-orphan')
+
+class FabricVariant(db.Model):
+    __tablename__ = 'fabric_variants'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    fabric_id = db.Column(db.Integer, db.ForeignKey('fabrics.id'), nullable=False)
+    image = db.Column(db.String(255), nullable=True)
+    composition = db.Column(db.String(255), nullable=True)
+    structure = db.Column(db.String(255), nullable=True)
+    shade = db.Column(db.String(100), nullable=True)
+    brand = db.Column(db.String(100), nullable=True)
+    code = db.Column(db.String(100), nullable=True)
+    rate = db.Column(db.String(100), nullable=True)
+    supplier = db.Column(db.String(100), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+PREDEFINED_SAMPLE_TYPES = ['Fit Sample', 'PP Sample', 'SMS', 'Photoshoot Sample', 'TOP Sample', 'FOB Sample']
 
 
 PREDEFINED_PROCESSES = [
@@ -351,6 +425,7 @@ def add_style():
     # Add steps for the task
     steps = ["Start","Indent","PatternCutting","FabricCutting","Sewing","Embroidery","Finishing", "Problem"]
     process_names = [item["process"] for item in PREDEFINED_PROCESSES]
+    process_names.insert(0,"Start")
     process_names.append("Problem")
     # steps = ["start", "indent", "pattern", "fabric", "embroidery", "packing", "problem"]
     for step in process_names:
@@ -418,8 +493,8 @@ def update_style(style_id):
         steps = ["Start","Indent","PatternCutting","FabricCutting","Sewing","Embroidery","Finishing", "Problem"]
         # steps = ["start", "indent", "pattern", "fabric", "embroidery", "packing", "problem"]
         process_names = [item["process"] for item in PREDEFINED_PROCESSES]
+        process_names.insert(0,"Start")
         process_names.append("Problem")
-
         for step in process_names:
             db.session.add(TaskStep(task_id=new_task.id, step_name=step, is_completed=False))
         db.session.commit()
@@ -438,7 +513,162 @@ def update_style(style_id):
         db.session.add(new_lab_dip)
         db.session.commit()
 
+    sample_tracking_sample = SampleTrackerStyle.query.filter_by(style_number=data['styleNumber']).first()
+
+    if not sample_tracking_sample:
+        new_style = SampleTrackerStyle(
+            style_number=data['styleNumber'],
+            brand=data['brand'],
+            garment_type=data['garment'],
+            start_date=datetime.now(timezone.utc) # Set start date on creation
+        )
+        db.session.add(new_style)
+        db.session.flush()  # Flush to get the new_style.id for linking samples
+
+        # Add predefined samples to this new style
+        for sample_type_name in PREDEFINED_SAMPLE_TYPES:
+            sample = SampleTrackerSample(
+                style_id=new_style.id,
+                type=sample_type_name,
+                completed=False
+                # start_date and end_date will be null initially
+            )
+            db.session.add(sample)
+
+        db.session.commit()
+
     return jsonify({"message": "Style updated successfully"}), 200
+#----------------- Sample Tracking ---------------------
+
+
+# --- API Endpoints for Sample Tracker ---
+
+@app.route('/api/sample-tracker/sample-types', methods=['GET'])
+def get_predefined_sample_types():
+    """Returns the list of predefined sample types."""
+    return jsonify(PREDEFINED_SAMPLE_TYPES)
+
+@app.route('/api/sample-tracker/styles', methods=['GET'])
+def get_all_sample_tracker_styles():
+    """Gets all sample tracker styles and their associated samples."""
+    styles = SampleTrackerStyle.query.order_by(SampleTrackerStyle.start_date.desc()).all()
+    return jsonify([s.to_dict() for s in styles])
+
+@app.route('/api/sample-tracker/styles', methods=['POST'])
+def create_sample_tracker_style():
+    """Creates a new style and initializes it with predefined samples."""
+    data = request.json
+    if not data or not data.get('styleNumber') or not data.get('brand') or not data.get('garmentType'):
+        return jsonify({"error": "Missing required fields: styleNumber, brand, garmentType"}), 400
+
+    new_style = SampleTrackerStyle(
+        style_number=data['styleNumber'],
+        brand=data['brand'],
+        garment_type=data['garmentType'],
+        start_date=datetime.now(timezone.utc) # Set start date on creation
+    )
+    db.session.add(new_style)
+    db.session.flush()  # Flush to get the new_style.id for linking samples
+
+    # Add predefined samples to this new style
+    for sample_type_name in PREDEFINED_SAMPLE_TYPES:
+        sample = SampleTrackerSample(
+            style_id=new_style.id,
+            type=sample_type_name,
+            completed=False
+            # start_date and end_date will be null initially
+        )
+        db.session.add(sample)
+
+    db.session.commit()
+    return jsonify(new_style.to_dict()), 201
+
+@app.route('/api/sample-tracker/styles/<int:style_id>', methods=['DELETE'])
+def remove_sample_tracker_style(style_id):
+    """Deletes a style and its associated samples."""
+    style = SampleTrackerStyle.query.get(style_id)
+    if not style:
+        return jsonify({"error": "Style not found"}), 404
+
+    db.session.delete(style)  # Cascade delete will handle samples
+    db.session.commit()
+    return jsonify({"message": "Style and its samples deleted successfully"}), 200
+
+@app.route('/api/sample-tracker/styles/<int:style_id>/samples', methods=['POST'])
+def add_custom_sample_to_style(style_id):
+    """Adds a new custom sample to an existing style."""
+    style = SampleTrackerStyle.query.get(style_id)
+    if not style:
+        return jsonify({"error": "Style not found"}), 404
+
+    data = request.json
+    sample_type = data.get('type')
+    if not sample_type or not sample_type.strip():
+        return jsonify({"error": "Sample type is required and cannot be empty"}), 400
+
+    new_sample = SampleTrackerSample(
+        style_id=style.id,
+        type=sample_type.strip(),
+        completed=False
+    )
+    db.session.add(new_sample)
+    db.session.commit()
+    # Return the updated style object
+    return jsonify(style.to_dict()), 201
+
+
+@app.route('/api/sample-tracker/styles/<int:style_id>/samples/<int:sample_id>', methods=['DELETE'])
+def remove_sample_from_style(style_id, sample_id):
+    """Deletes a specific sample from a style."""
+    sample = SampleTrackerSample.query.filter_by(id=sample_id, style_id=style_id).first()
+    if not sample:
+        return jsonify({"error": "Sample not found or does not belong to the specified style"}), 404
+
+    db.session.delete(sample)
+    db.session.commit()
+    # Return the updated parent style object
+    style = SampleTrackerStyle.query.get(style_id)
+    return jsonify(style.to_dict()), 200
+
+
+@app.route('/api/sample-tracker/styles/<int:style_id>/samples/<int:sample_id>/toggle', methods=['PUT'])
+def update_sample_status(style_id, sample_id):
+    """Toggles the completion status of a sample and updates its dates."""
+    sample = SampleTrackerSample.query.filter_by(id=sample_id, style_id=style_id).first()
+    if not sample:
+        return jsonify({"error": "Sample not found or does not belong to the specified style"}), 404
+
+    sample.completed = not sample.completed
+    current_time = datetime.now(timezone.utc)
+
+    if sample.completed:
+        if not sample.start_date: # Set start_date only if it's not already set
+            sample.start_date = current_time
+        sample.end_date = current_time
+    else:
+        # When un-completing, nullify the end_date.
+        # Decide if start_date should also be nullified or preserved. Preserving is common.
+        sample.end_date = None
+        # If you want to reset start_date as well when un-completing:
+        # sample.start_date = None
+
+    db.session.commit() # Commit sample changes first
+
+    # After updating the sample, check if the parent style is now fully completed
+    style = SampleTrackerStyle.query.get(style_id)
+    if style:
+        all_samples_completed = all(s.completed for s in style.samples)
+        if all_samples_completed:
+            if not style.end_date: # Set style end_date only if not already set
+                 style.end_date = current_time # Or max(s.end_date for s in style.samples if s.end_date)
+        else:
+            style.end_date = None # If any sample is not complete, style is not complete
+        db.session.commit()
+
+    # Return the updated parent style object
+    return jsonify(style.to_dict()), 200
+
+
 
 # ---------------- Activity Routes (Using SQLAlchemy) ----------------
 @app.route("/api/activity", methods=["GET"])
@@ -497,7 +727,7 @@ def add_activities():
             duration=process["duration"],
             planned_start=planned_start.strftime("%Y-%m-%d"),
             planned_end=planned_end.strftime("%Y-%m-%d"),
-            actual_start=None,
+            actual_start=datetime.strptime(received_date, "%Y-%m-%d") if process["process"] == "Order Receipt (Buyer PO)" else None,
             actual_end=None,
             actual_duration=None,
             delay=None,
@@ -520,26 +750,68 @@ def update_activity(id):
 
     if actual_start:
         try:
+            # First try parsing with just the date
             actual_start_date = datetime.strptime(actual_start, "%Y-%m-%d")
-            activity.actual_start = actual_start
+            activity.actual_start = actual_start_date
         except ValueError:
-            return jsonify({"error": "Invalid actual_start format. Use YYYY-MM-DD"}), 400
+            try:
+                # If that fails, try with time component
+                actual_start_date = datetime.strptime(actual_start, "%Y-%m-%d %H:%M:%S")
+                activity.actual_start = actual_start
+            except ValueError:
+                return jsonify({"error": "Invalid actual_start format. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"}), 400
 
     if actual_end:
         try:
+            # First try parsing with just the date
             actual_end_date = datetime.strptime(actual_end, "%Y-%m-%d")
             activity.actual_end = actual_end
         except ValueError:
-            return jsonify({"error": "Invalid actual_end format. Use YYYY-MM-DD"}), 400
+            try:
+                # If that fails, try with time component
+                actual_end_date = datetime.strptime(actual_end, "%Y-%m-%d %H:%M:%S")
+                activity.actual_end = actual_end
+            except ValueError:
+                return jsonify({"error": "Invalid actual_end format. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"}), 400
 
     if activity.actual_start and activity.actual_end:
-        start_date = (activity.actual_start)
-        end_date = (activity.actual_end)
+        # Parse dates with flexible formats
+        try:
+            # Try parsing with date format first
+            start_date = datetime.strptime(activity.actual_start, "%Y-%m-%d")
+        except ValueError:
+            try:
+                # Try with time component if date-only format fails
+                start_date = datetime.strptime(activity.actual_start, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return jsonify({"error": f"Could not parse actual_start date: {activity.actual_start}"}), 400
+                
+        try:
+            # Try parsing with date format first
+            end_date = datetime.strptime(activity.actual_end, "%Y-%m-%d")
+        except ValueError:
+            try:
+                # Try with time component if date-only format fails
+                end_date = datetime.strptime(activity.actual_end, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return jsonify({"error": f"Could not parse actual_end date: {activity.actual_end}"}), 400
+        
+        # Calculate duration
         activity.actual_duration = (end_date - start_date).days
 
         if activity.planned_end:
-            planned_end_date = (activity.planned_end)
-            activity.delay = max((end_date - planned_end_date).days, 0)
+            try:
+                # Try to parse the planned_end date with date-only format
+                planned_end_date = datetime.strptime(activity.planned_end, "%Y-%m-%d")
+                activity.delay = max((end_date - planned_end_date).days, 0)
+            except ValueError:
+                try:
+                    # Try with time component if date-only format fails
+                    planned_end_date = datetime.strptime(activity.planned_end, "%Y-%m-%d %H:%M:%S")
+                    activity.delay = max((end_date - planned_end_date).days, 0)
+                except ValueError:
+                    print(f"Could not parse planned_end date: {activity.planned_end}")
+                    activity.delay = None
 
     db.session.commit()
     return jsonify({"message": "Activity updated successfully"}), 200
@@ -548,7 +820,7 @@ def update_activity(id):
 def get_approval_status():
     styles = Style.query.all()
     
-    categorized_samples = {"received": [], "pending": [], "yetToSend": [], "queued" : []}
+    categorized_samples = {"received": [], "pending": [], "yetToSend": [], "queued" : [], "rejected" : []}
     
     for style in styles:
         categorized_samples[style.approval_status].append(style.to_dict())
@@ -562,7 +834,7 @@ def update_status():
     style_id = data.get("id")
     new_status = data.get("approvalStatus")
 
-    if new_status not in ["received", "pending", "yetToSend"]:
+    if new_status not in ["received", "pending", "yetToSend", "rejected"]:
         return jsonify({"error": "Invalid status"}), 400
 
     style = Style.query.get(style_id)
@@ -591,6 +863,7 @@ def add_task():
     # steps = ["start", "indent", "pattern", "fabric", "embroidery", "packing", "problem"]
     steps = ["Start","Indent","PatternCutting","FabricCutting","Sewing","Embroidery","Finishing", "Problem"]
     process_names = [item["process"] for item in PREDEFINED_PROCESSES]
+    process_names.insert(0,"Start")
     process_names.append("Problem")
     for step in process_names:
         db.session.add(TaskStep(task_id=new_task.id, step_name=step, is_completed=False))
@@ -916,6 +1189,7 @@ def upload_files_new():
         return jsonify({"message": "Buyer Name and Garment are required!"}), 400
     
     uploaded_files = {}
+    fileNames = []
     for file_key in ["techpack", "bom", "specSheet"]:
         if file_key in request.files:
             file = request.files[file_key]
@@ -927,11 +1201,12 @@ def upload_files_new():
                 )
                 file.save(file_path)
                 uploaded_files[file_key] = file_path
+                fileNames.append(file.filename)
     
     # If at least Techpack and BOM files were uploaded, create a new Style entry
     if "techpack" in uploaded_files and "bom" in uploaded_files:
         # Generate style metadata and techpack data using AI
-        ai_result = generateTechPackDataFromAi(buyer_name,garment)
+        ai_result = generateTechPackDataFromAi(buyer_name,garment,fileNames)
         style_metadata = ai_result.get("style_metadata", {})
         techpack_data = ai_result.get("techpack_data", {})
         
@@ -951,6 +1226,31 @@ def upload_files_new():
         
         db.session.add(new_style)
         db.session.commit()
+        sample_tracking_sample = SampleTrackerStyle.query.filter_by(style_number=style_metadata.get("style_number")).first()
+
+        if not sample_tracking_sample:
+            new_sample_style = SampleTrackerStyle(
+                style_number=style_metadata.get("style_number"),
+                brand=style_metadata.get("brand"),
+                garment_type=style_metadata.get("garment"),
+                start_date=datetime.now(timezone.utc) # Set start date on creation
+            )
+            db.session.add(new_sample_style)
+            db.session.flush()  # Flush to get the new_style.id for linking samples
+
+            # Add predefined samples to this new style
+            for sample_type_name in PREDEFINED_SAMPLE_TYPES:
+                sample = SampleTrackerSample(
+                    style_id=new_sample_style.id,
+                    type=sample_type_name,
+                    completed=False
+                    # start_date and end_date will be null initially
+                )
+                db.session.add(sample)
+
+            db.session.commit()
+
+        
         
         return jsonify({
             "message": "Files uploaded and style created successfully!",
@@ -1194,9 +1494,8 @@ def add_trim():
         structure=data.get('structure', ''),
         shade=data.get('shade', ''),
         brand=data.get('brand', ''),
-        code=data.get('code', ''),
-        rate =data.get('rate','')
-    )
+        code=data.get('code', '')
+        )
     db.session.add(new_trim)
     db.session.commit()
     return jsonify({'message': 'Trim added successfully'}), 201
@@ -1314,6 +1613,18 @@ def delete_notification(id):
     db.session.commit()
     return jsonify({"message": "Notification deleted successfully"})
 
+@app.route('/api/notifications/clear-all', methods=['DELETE'])
+def delete_all_notification():
+    notifications = Notification.query.filter_by(read_status=False).all()
+    if not notifications:
+        return jsonify({"error": "Notification not found"}), 404
+
+    for notification in notifications:  # Iterate through the list
+        db.session.delete(notification) 
+    db.session.commit()
+    return jsonify({"message": "Notifications deleted successfully"})
+
+
 
 def query_gemini(prompt):
     """Send a query to Gemini and return the response."""
@@ -1330,7 +1641,7 @@ def generate_ai_response(query, data):
     return response.text.strip()
 
 
-def generateTechPackDataFromAi(buyer_name,garment):
+def generateTechPackDataFromAi(buyer_name,garment,fileNames):
     """
     Process uploaded techpack and BOM files using Google's Gemini LLM
     to extract and structure the techpack data along with style details.
@@ -1343,13 +1654,26 @@ def generateTechPackDataFromAi(buyer_name,garment):
     # Find the most recently uploaded techpack and BOM files
     files = {}
     for filename in os.listdir(upload_folder):
-        if "_techpack_" in filename.lower() and os.path.isfile(os.path.join(upload_folder, filename)):
+        if "_techpack_" in filename.lower() and os.path.isfile(os.path.join(upload_folder, filename)) and any(name in filename for name in fileNames):
             files["techpack"] = os.path.join(upload_folder, filename)
-        elif "_bom_" in filename.lower() and os.path.isfile(os.path.join(upload_folder, filename)):
+        elif "_bom_" in filename.lower() and os.path.isfile(os.path.join(upload_folder, filename)) and any(name in filename for name in fileNames):
             files["bom"] = os.path.join(upload_folder, filename)
         elif "_specSheet_" in filename.lower() and os.path.isfile(os.path.join(upload_folder, filename)):
             files["specSheet"] = os.path.join(upload_folder, filename)
     trims_data = db.session.query(Trim.name, TrimVariant).join(TrimVariant, Trim.id == TrimVariant.trim_id).all()
+    trim_variant_list = []
+
+    for trim_name, variant in trims_data:
+        trim_variant_list.append({
+            "trim_name": trim_name,
+            "id": variant.id,
+            "composition": variant.composition,
+            "structure": variant.structure,
+            "shade": variant.shade,
+            "brand": variant.brand,
+            "code": variant.code,
+            "rate": variant.rate
+        })
 
     # Read the file contents based on file type
     file_contents = {}
@@ -1386,9 +1710,8 @@ def generateTechPackDataFromAi(buyer_name,garment):
     2. Basic product information: shade, patternNo, season, mainBodyFabric, collarFabric, mainLabel, threadShade, sewingThreads, sewingThreadsDetails
     3. Cost sheet information with fabric costs and trim costs
     4. BOM (Bill of Materials) information including fabrics and trims
-    Extract trims data from BOM and populate the respective fields in the JSON, if code matches for a specific trim add the cost for it also.
-    Populate the same data as BOM in trim cost maintaing the format for both the keys.
-    While extracting label trims only extract the Main Label and Size Label trims, for trims that are a label extract only one of each. Extract for the size mentioned in the techpack. 
+    5. After extracting BOM and Techpack data analyze the trims data and populate the 'costSheet' key in the format described below by matching all trims and fabrics code and taking rate from trims data. 
+    6. For Quantity use the Consumption value instead of quantity as consumption is quantity per garment which is what we are capturing here
     Format the response exactly like this example:
     {{  
         "style_metadata": {{
@@ -1414,19 +1737,23 @@ def generateTechPackDataFromAi(buyer_name,garment):
                 "fabricCost": [
                     {{
                         "fabricType": "Shell Fabric",
-                        "description": "Jersey Waffle 100% Cotton"
+                        "description": "Jersey Waffle 100% Cotton",
+                        "quantity": "3",
+                        "rate" : 242
                     }}
                 ],
                 "trimCost": [
                     {{
                         "trim": "BUTTON",
                         "description": "20134935 - 4 Holes - Gritt",
-                        "quantity": "3"
+                        "quantity": "3",
+                        "rate" : 242
                     }},
                     {{
                         "trim": "Interlining",
                         "description": "Fusible interlining 9510",
-                        "quantity": "66"
+                        "quantity": "66",
+                        "rate" : 242
                     }}
                     // other trim costs...
                 ]
@@ -1434,11 +1761,12 @@ def generateTechPackDataFromAi(buyer_name,garment):
             "bom": {{
                 "fabric": [
                     {{
-                        "code": "",
+                        "code": "STIINCOTGEN581111",
                         "description": "Jersey Waffle 100% Cotton",
                         "color": "Ivory",
                         "size": "M",
-                        "quantity": "1"
+                        "quantity": "1",
+                        "supplier" : "MANOHAR FILAMENT"
                     }}
                 ],
                 "trims": [
@@ -1448,7 +1776,8 @@ def generateTechPackDataFromAi(buyer_name,garment):
                         "description": "Fusible interlining 9510",
                         "color": "9510 COL.3216 BLACK",
                         "size": "M",
-                        "quantity": "66.00"
+                        "quantity": "66.00",
+                        "supplier" : "MANOHAR FILAMENT"
                     }}
                     // other trims...
                 ]
@@ -1465,6 +1794,7 @@ def generateTechPackDataFromAi(buyer_name,garment):
     
     BOM data:
     {1}
+
     Trims data:
     {2}
     If you are unable to fetch buyer name from provided data use this: {3}
@@ -1475,7 +1805,7 @@ def generateTechPackDataFromAi(buyer_name,garment):
     formatted_prompt = prompt.format(
         file_contents.get("techpack", "No techpack file found"),
         file_contents.get("bom", "No BOM file found"),
-        trims_data,
+        trim_variant_list,
         buyer_name,
         garment
         # If you want to include specSheet data, uncomment the line below
@@ -1652,37 +1982,62 @@ def extract_text_from_pdf(pdf_path):
 
 def extract_text_from_excel(excel_path):
     """
-    Extract text content from an Excel file (xlsx or xls)
+    Extract text content from an Excel file (xlsx or xls), attempting to detect a meaningful table
+    by matching expected column headers. Falls back to default logic if no match is found.
     """
     text = ""
+    expected_headers = [
+        "Name", "Order Qty", "SIZE", "Description", "supplier", "COLOUR",
+        "SAP Item Code", "Consumption", "Total Required Qty", "UOM",
+        "PR Trims Released date-26.11.2024 &  Fabric-28.11.2024", "SAP PR QTY",
+        "PO QTY", "PO NUMBERS", "PO DATE", "PRICE", "VALUE", "INHOUSE DATE", "Remarks"
+    ]
+
     try:
-        # Try using pandas first, which is generally more robust
+        # Try using pandas first
         try:
-            # Read all sheets
             xls = pd.ExcelFile(excel_path)
             sheet_names = xls.sheet_names
-            
+
             for sheet_name in sheet_names:
-                df = pd.read_excel(excel_path, sheet_name=sheet_name)
+                df_raw = pd.read_excel(excel_path, sheet_name=sheet_name, header=None)
+
+                # Try to find a header row with partial match
+                header_row_index = None
+                for idx, row in df_raw.iterrows():
+                    row_str = row.astype(str).str.lower().tolist()
+                    match_count = sum(1 for header in expected_headers if header.lower() in row_str)
+                    if match_count >= 5:
+                        header_row_index = idx
+                        break
+
                 text += f"Sheet: {sheet_name}\n"
-                text += df.to_string(index=False) + "\n\n"
-        
-        # If pandas fails, try openpyxl as a backup
+                
+                if header_row_index is not None:
+                    df_table = pd.read_excel(excel_path, sheet_name=sheet_name, header=header_row_index)
+                    df_table_cleaned = df_table.dropna(how='all')
+                    text += df_table_cleaned.to_string(index=False) + "\n\n"
+                else:
+                    # Fall back to default if no header match found
+                    df_fallback = pd.read_excel(excel_path, sheet_name=sheet_name)
+                    text += df_fallback.to_string(index=False) + "\n\n"
+
+        # If pandas fails, use openpyxl
         except:
             workbook = load_workbook(filename=excel_path, read_only=True, data_only=True)
-            
+
             for sheet_name in workbook.sheetnames:
                 sheet = workbook[sheet_name]
                 text += f"Sheet: {sheet_name}\n"
-                
+
                 for row in sheet.rows:
                     row_text = " | ".join([str(cell.value) if cell.value is not None else "" for cell in row])
                     text += row_text + "\n"
                 text += "\n"
-    
+
     except Exception as e:
         text = f"Error extracting text from Excel: {str(e)}"
-    
+
     return text
 
 @app.route('/api/activity/update', methods=['POST'])
@@ -1693,7 +2048,7 @@ def update_activity_from_progress():
     is_checked = data.get('isChecked')
     next_process = data.get('nextProcess')
     
-    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    current_time = datetime.now().strftime('%Y-%m-%d')
     
     # Find the activity record for the current process
     activity = Activity.query.filter_by(style=style, process=process).first()
@@ -1707,13 +2062,13 @@ def update_activity_from_progress():
         
         # Calculate actual duration if actual_start exists
         if activity.actual_start:
-            actual_start_time = datetime.strptime(activity.actual_start, '%Y-%m-%d %H:%M:%S')
-            actual_end_time = datetime.strptime(current_time, '%Y-%m-%d %H:%M:%S')
+            actual_start_time = datetime.strptime(activity.actual_start, '%Y-%m-%d')
+            actual_end_time = datetime.strptime(current_time, '%Y-%m-%d')
             activity.actual_duration = (actual_end_time - actual_start_time).total_seconds() / 3600  # Convert to hours
             
             # Calculate delay if planned_end exists
             if activity.planned_end:
-                planned_end_time = datetime.strptime(activity.planned_end, '%Y-%m-%d %H:%M:%S')
+                planned_end_time = datetime.strptime(activity.planned_end, '%Y-%m-%d')
                 activity.delay = (actual_end_time - planned_end_time).total_seconds() / 3600  # Convert to hours
         
         # If there's a next process, update its actual_start time
@@ -1772,7 +2127,7 @@ def create_activities_from_progress():
         return jsonify({"error": "Style and processes are required"}), 400
     
     # Default values for new activities
-    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    current_time = datetime.now().strftime('%Y-%m-%d')
     
     created_activities = []
     
@@ -1782,11 +2137,11 @@ def create_activities_from_progress():
         
         # Simple logic to stagger planned times - adjust as needed
         if i > 0:
-            previous_planned_end = datetime.strptime(planned_start, '%Y-%m-%d %H:%M:%S')
-            planned_start = (previous_planned_end + datetime.timedelta(hours=2)).strftime('%Y-%m-%d %H:%M:%S')
+            previous_planned_end = datetime.strptime(planned_start, '%Y-%m-%d')
+            planned_start = (previous_planned_end + datetime.timedelta(hours=2)).strftime('%Y-%m-%d')
         
-        planned_end = (datetime.strptime(planned_start, '%Y-%m-%d %H:%M:%S') + 
-                      datetime.timedelta(hours=4)).strftime('%Y-%m-%d %H:%M:%S')  # Default 4 hours per process
+        planned_end = (datetime.strptime(planned_start, '%Y-%m-%d') + 
+                      datetime.timedelta(hours=4)).strftime('%Y-%m-%d')  # Default 4 hours per process
         
         # Create the activity record
         activity = Activity(
@@ -1922,6 +2277,81 @@ def get_response_string_from_style_info(style_info, task_info, activity_info : A
 
     return f"Style Number : {style_info.style_number} \n Brand: {style_info.brand} \n Task Status: {task_info.status} \n Activity Status: {current_activity.process}"
 
+@app.route("/analyze-image", methods=["POST"])
+def analyze_image():
+    image_file = request.files.get("image")
+    if not image_file:
+        return jsonify({"error": "No image uploaded"}), 400
+
+    try:
+        # Read and process the image
+        image_bytes = image_file.read()
+        
+        # Create PIL Image object
+        pil_image = Image.open(io.BytesIO(image_bytes))
+        
+        # Convert to RGB if necessary (handles RGBA, etc.)
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+
+        model = genai.GenerativeModel("gemini-1.5-flash")
+
+        prompt = """
+You are a fashion image analysis assistant.
+
+Analyze the garment in this image and provide your assessment in the following structured JSON format:
+
+{
+  "garmentType": "",
+  "pattern": "",
+  "color": "",
+  "fit": "",
+  "style": "",
+  "collarType": "",
+  "gender": "",
+  "patternDistribution": {
+    "Stripes": 0,
+    "Checks": 0,
+    "Solid": 0,
+    "Floral": 0
+  },
+  "colorDistribution": {
+    "Blue": 0,
+    "Red": 0,
+    "White": 0,
+    "Black": 0
+  }
+}
+
+Please analyze:
+- The type of garment (shirt, dress, pants, etc.)
+- The pattern (if any)
+- Primary colors
+- The fit and style
+- Collar type (if applicable)
+- Gender target (male/female/unisex)
+- Pattern distribution as percentages (0-100)
+- Color distribution as percentages (0-100)
+
+Respond only with the JSON structure filled with your analysis.
+        """
+
+        # Generate content with both text prompt and image
+        response = model.generate_content([prompt, pil_image])
+        
+        # Extract and return the JSON response
+        return jsonify(extract_json(response.text))
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+def extract_json(text):
+    import json, re
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    raise ValueError("No JSON found in response")
+
 # Role-based access control decorators
 def admin_required(f):
     @wraps(f)
@@ -1976,6 +2406,127 @@ def get_audit_logs():
         'timestamp': log.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
         'ip_address': log.ip_address
     } for log in logs])
+
+# Fabric routes
+@app.route('/api/fabrics', methods=['GET'])
+def get_fabrics():
+    """Get all fabrics"""
+    fabrics = Fabric.query.all()
+    return jsonify([{
+        'id': fabric.id,
+        'name': fabric.name,
+        'image': fabric.image
+    } for fabric in fabrics])
+
+@app.route('/api/fabrics', methods=['POST'])
+def create_fabric():
+    """Create a new fabric"""
+    data = request.get_json()
+    
+    # Check if fabric already exists
+    existing_fabric = Fabric.query.filter_by(name=data['name']).first()
+    if existing_fabric:
+        return jsonify({'error': 'Fabric already exists'}), 400
+    
+    fabric = Fabric(
+        name=data['name'],
+        image=data.get('image', '')
+    )
+    
+    db.session.add(fabric)
+    db.session.commit()
+    
+    return jsonify({
+        'id': fabric.id,
+        'name': fabric.name,
+        'image': fabric.image
+    }), 201
+
+@app.route('/api/fabrics/<fabric_name>', methods=['GET'])
+def get_fabric_detail(fabric_name):
+    """Get fabric details with variants"""
+    fabric = Fabric.query.filter_by(name=fabric_name).first()
+    if not fabric:
+        return jsonify({'error': 'Fabric not found'}), 404
+    
+    variants = FabricVariant.query.filter_by(fabric_id=fabric.id).all()
+    
+    return jsonify({
+        'id': fabric.id,
+        'name': fabric.name,
+        'image': fabric.image,
+        'variants': [{
+            'id': variant.id,
+            'image': variant.image,
+            'composition': variant.composition,
+            'structure': variant.structure,
+            'shade': variant.shade,
+            'brand': variant.brand,
+            'code': variant.code,
+            'rate': variant.rate,
+            'supplier' : variant.supplier
+        } for variant in variants]
+    })
+
+@app.route('/api/fabrics/<fabric_name>', methods=['DELETE'])
+def delete_fabric(fabric_name):
+    """Delete a fabric and all its variants"""
+    fabric = Fabric.query.filter_by(name=fabric_name).first()
+    if not fabric:
+        return jsonify({'error': 'Fabric not found'}), 404
+    
+    db.session.delete(fabric)
+    db.session.commit()
+    
+    return jsonify({'message': 'Fabric deleted successfully'})
+
+@app.route('/api/fabrics/<int:fabric_id>/variants', methods=['POST'])
+def add_fabric_variant(fabric_id):
+    """Add a variant to a fabric"""
+    fabric = Fabric.query.get(fabric_id)
+    if not fabric:
+        return jsonify({'error': 'Fabric not found'}), 404
+    
+    data = request.get_json()
+    
+    variant = FabricVariant(
+        fabric_id=fabric_id,
+        image=data.get('image', ''),
+        composition=data.get('composition', ''),
+        structure=data.get('structure', ''),
+        shade=data.get('shade', ''),
+        brand=data.get('brand', ''),
+        code=data.get('code', ''),
+        rate=data.get('rate', ''),
+        supplier = data.get('supplier', '')
+    )
+    
+    db.session.add(variant)
+    db.session.commit()
+    
+    return jsonify({
+        'id': variant.id,
+        'image': variant.image,
+        'composition': variant.composition,
+        'structure': variant.structure,
+        'shade': variant.shade,
+        'brand': variant.brand,
+        'code': variant.code,
+        'rate': variant.rate
+    }), 201
+
+@app.route('/api/fabric-variants/<int:variant_id>', methods=['DELETE'])
+def delete_fabric_variant(variant_id):
+    """Delete a fabric variant"""
+    variant = FabricVariant.query.get(variant_id)
+    if not variant:
+        return jsonify({'error': 'Variant not found'}), 404
+    
+    db.session.delete(variant)
+    db.session.commit()
+    
+    return jsonify({'message': 'Variant deleted successfully'})
+
 
 # Initialize roles if they don't exist
 def initialize_roles():
