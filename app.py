@@ -20,7 +20,7 @@ from PIL import Image
 app = Flask(__name__)
 
 # Enable CORS
-CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
+CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "https://samplify.pages.dev"]}})
 
 # MySQL Database Configuration (Using SQLAlchemy)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:kCqfHlGuizCLUcGqPvcEdtncUWoONxhs@shortline.proxy.rlwy.net:36614/railway'
