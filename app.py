@@ -1674,6 +1674,22 @@ def generateTechPackDataFromAi(buyer_name,garment,fileNames):
             "code": variant.code,
             "rate": variant.rate
         })
+    fabric_variant_list = []
+
+    fabric_data = db.session.query(Fabric.name, FabricVariant).join(FabricVariant, Fabric.id == FabricVariant.fabric_id).all()
+    for fabric_name, variant in fabric_data:
+        fabric_variant_list.append({
+            "fabric_name": fabric_name,
+            "id": variant.id,
+            "composition": variant.composition,
+            "structure": variant.structure,
+            "shade": variant.shade,
+            "brand": variant.brand,
+            "code": variant.code,
+            "rate": variant.rate,
+            "supplier" : variant.supplier
+        })
+
 
     # Read the file contents based on file type
     file_contents = {}
@@ -1797,8 +1813,10 @@ def generateTechPackDataFromAi(buyer_name,garment,fileNames):
 
     Trims data:
     {2}
-    If you are unable to fetch buyer name from provided data use this: {3}
-    If you are unable to extract garment type from provided data user this : {4}
+    Fabric data:
+    {3}
+    If you are unable to fetch buyer name from provided data use this: {4}
+    If you are unable to extract garment type from provided data user this : {5}
     ''' # You could add {2} here if you plan to include specSheet_data in the format call
     
     # Format the prompt with the file contents
@@ -1806,6 +1824,7 @@ def generateTechPackDataFromAi(buyer_name,garment,fileNames):
         file_contents.get("techpack", "No techpack file found"),
         file_contents.get("bom", "No BOM file found"),
         trim_variant_list,
+        fabric_variant_list,
         buyer_name,
         garment
         # If you want to include specSheet data, uncomment the line below
