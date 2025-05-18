@@ -367,11 +367,12 @@ def login():
     # Update last login
     user.last_login = datetime.utcnow()
     db.session.commit()
-
+    role_name = Role.query.get(user.role_id).name if user.role_id else None
     access_token = create_access_token(identity=user.id)
     return jsonify({
         "access_token": access_token,
         "role": user.role_id,
+        "role_name" : role_name,
         "username": user.username
     }), 200
 
@@ -2549,7 +2550,7 @@ def delete_fabric_variant(variant_id):
 
 # Initialize roles if they don't exist
 def initialize_roles():
-    roles = ['admin', 'manager', 'user']
+    roles = ['admin', 'manager', 'user', 'PD', 'sampling','embroidery']
     for role_name in roles:
         if not Role.query.filter_by(name=role_name).first():
             role = Role(name=role_name, description=f'{role_name.capitalize()} role')
