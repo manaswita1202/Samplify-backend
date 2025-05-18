@@ -23,7 +23,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
 
 # MySQL Database Configuration (Using SQLAlchemy)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:root@localhost/samplify'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:kCqfHlGuizCLUcGqPvcEdtncUWoONxhs@shortline.proxy.rlwy.net:36614/railway'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'ashirwad'  # Change this to a secure secret key
 
