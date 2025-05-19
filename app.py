@@ -2336,7 +2336,9 @@ Analyze the garment in this image and provide your assessment in the following s
     "Stripes": 0,
     "Checks": 0,
     "Solid": 0,
-    "Floral": 0
+    "Floral": 0,
+    "zigzag": 0,
+    "chevron": 0
   },
   "colorDistribution": [
     {
