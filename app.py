@@ -941,40 +941,42 @@ def update_task(task_id):
 
     # Update steps
     if "steps" in data:
-        for item  in data["steps"]:
+        for item in data["steps"]:
             step = TaskStep.query.filter_by(task_id=task_id, step_name=item["step_name"]).first()
             if step:
                 step.is_completed = item["is_completed"]
 
     db.session.commit()
     if "status" in data and data["status"] == "completed":
-        courier = Courier(
-        style_number=task.style_number,
-        courier_name="Blue Dart",
-        awb_number="#2025" + str(random.randint(1,20000)),
-        att="#ASJK" + str(random.randint(1,50)),
-        content=task.sample_type,
-        garment_type=task.garment
-    )
-        db.session.add(courier)
-        db.session.commit()
-
-        for order_type in ['Booked Portal', 'Sent from Factory', 'In Transit', 'Received']:
-            order_status = OrderStatus(
-                courier_id=courier.id,
-                type=order_type
+        # Check if a Courier already exists for this style_number
+        existing_courier = Courier.query.filter_by(style_number=task.style_number).first()
+        if not existing_courier:
+            courier = Courier(
+                style_number=task.style_number,
+                courier_name="Blue Dart",
+                awb_number="#2025" + str(random.randint(1, 20000)),
+                att="#ASJK" + str(random.randint(1, 50)),
+                content=task.sample_type,
+                garment_type=task.garment
             )
-            db.session.add(order_status)
-        
-        db.session.commit()
+            db.session.add(courier)
+            db.session.commit()
+
+            for order_type in ['Booked Portal', 'Sent from Factory', 'In Transit', 'Received']:
+                order_status = OrderStatus(
+                    courier_id=courier.id,
+                    type=order_type
+                )
+                db.session.add(order_status)
+
+            db.session.commit()
+
         style = Style.query.filter_by(style_number=task.style_number).first()
         if style is not None:
             style.approval_status = "yetToSend"
             db.session.commit()
-        
 
     return jsonify({"message": "Task updated successfully"})
-
 # Delete a task
 @app.route("/tasks/<int:task_id>", methods=["DELETE"])
 def delete_task(task_id):
@@ -2316,7 +2318,8 @@ def analyze_image():
 
         model = genai.GenerativeModel("gemini-1.5-flash")
 
-        prompt = """
+        # Analysis prompt
+        analysis_prompt = """
 You are a fashion image analysis assistant.
 
 Analyze the garment in this image and provide your assessment in the following structured JSON format:
@@ -2335,12 +2338,13 @@ Analyze the garment in this image and provide your assessment in the following s
     "Solid": 0,
     "Floral": 0
   },
-  "colorDistribution": {
-    "Blue": 0,
-    "Red": 0,
-    "White": 0,
-    "Black": 0
-  }
+  "colorDistribution": [
+    {
+      "pantoneShade": "",
+      "percentage": 0
+    }
+  ],
+  "confidence" : 0
 }
 
 Please analyze:
@@ -2351,20 +2355,79 @@ Please analyze:
 - Collar type (if applicable)
 - Gender target (male/female/unisex)
 - Pattern distribution as percentages (0-100)
-- Color distribution as percentages (0-100)
-
+- Color distribution as a list of Pantone shades with their respective percentages (0-100)
+- Confidence level of the analysis (0-100)
 Respond only with the JSON structure filled with your analysis.
         """
 
         # Generate content with both text prompt and image
-        response = model.generate_content([prompt, pil_image])
+        analysis_response = model.generate_content([analysis_prompt, pil_image])
+        analysis_result = extract_json(analysis_response.text)
         
-        # Extract and return the JSON response
-        return jsonify(extract_json(response.text))
+        # Now get trend recommendations based on the garment type
+        recommendation_prompt = f"""
+You are a fashion trend expert. Based on the most current fashion trends, provide recommendations for 
+a {analysis_result['garmentType']} in the following JSON format:
+
+{{
+  "collarDistribution": {{
+    "Polo": 0,
+    "Cuban": 0,
+    "Revere": 0,
+    "Point": 0
+  }},
+  "sleeveDistribution": {{
+    "Half": 0,
+    "Full": 0
+  }},
+  "fitDistribution": {{
+    "Regular": 0,
+    "Slim": 0,
+    "Oversized": 0
+  }},
+  "patternDistribution": {{
+    "Argyle": 0,
+    "Checkerboard": 0,
+    "Plaid": 0,
+    "Gingham": 0,
+    "Floral": 0,
+    "Animal": 0,
+    "Stripes": 0,
+    "Solid": 0
+  }},
+  "fabricDistribution": {{
+    "Waffle Knit": 0,
+    "Pique Knit": 0,
+    "French Terry": 0,
+    "Jacquard": 0
+  }},
+  "colorDistribution": [
+    {{
+      "pantoneShade": "",
+      "percentage": 0
+    }}
+  ]
+}}
+
+Each distribution should represent the percentage trends for 2025, with values adding up to 100 in each category. 
+For colorDistribution, use Pantone shades with their respective percentages.
+
+Provide only the JSON response with no additional text.
+        """
+
+        recommendation_response = model.generate_content(recommendation_prompt)
+        recommendation_result = extract_json(recommendation_response.text)
+        
+        # Combine both results
+        combined_result = {
+            "analysis": analysis_result,
+            "recommendations": recommendation_result
+        }
+        
+        return jsonify(combined_result)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
 def extract_json(text):
     import json, re
     match = re.search(r'\{.*\}', text, re.DOTALL)
