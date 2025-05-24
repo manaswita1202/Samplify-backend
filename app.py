@@ -22,15 +22,16 @@ app = Flask(__name__)
 
 # Enable CORS
 CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "https://samplify.pages.dev"]}})
+GEMINI_API_SECRET_KEY = os.environ.get("GEMINI_API_SECRET_KEY")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # MySQL Database Configuration (Using SQLAlchemy)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:kCqfHlGuizCLUcGqPvcEdtncUWoONxhs@shortline.proxy.rlwy.net:36614/railway'
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'ashirwad'  # Change this to a secure secret key
-
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
-genai.configure(api_key="AIzaSyCyZPcCgke66CyRM_cgBu9EblT6aUbMKqA")
+genai.configure(api_key=GEMINI_API_SECRET_KEY)
 
 
 class CustomJSONEncoder(json.JSONEncoder):
