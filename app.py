@@ -1,3 +1,4 @@
+import secrets
 from flask import Flask, request, jsonify,send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
@@ -291,6 +292,17 @@ class FabricVariant(db.Model):
     supplier = db.Column(db.String(100), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+class Invite(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    invite_hash = db.Column(db.String(64), unique=True, nullable=False)
+    email = db.Column(db.String(120), nullable=False)
+    role_name = db.Column(db.String(50), nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used_at = db.Column(db.DateTime, nullable=True)
+    is_used = db.Column(db.Boolean, default=False)
+
 PREDEFINED_SAMPLE_TYPES = ['Fit Sample', 'PP Sample', 'SMS', 'Photoshoot Sample', 'TOP Sample', 'FOB Sample']
 
 
@@ -302,11 +314,11 @@ PREDEFINED_PROCESSES = [
     {"process": "Fabric Received", "duration": 34, "responsibility": "Store Manager"},
     {"process": "Sample Indent Made", "duration": 0.5, "responsibility": "Merchandiser"},
     {"process": "Pattern Cutting", "duration": 0.5, "responsibility": "Pattern Master"},
-    {"process": "Sewing", "duration": 4, "responsibility": "Production Head"},
+    {"process": "Sewing", "duration": 4, "responsibility": "Sampling Head"},
     {"process": "Embroidery", "duration": 0.5, "responsibility": "Embroidery Head"},
-    {"process": "Finishing", "duration": 0.5, "responsibility": "Production Head"},
-    {"process": "Packing", "duration": 1, "responsibility": "Production Head"},
-    {"process": "Documentation in PLM", "duration": 0.5, "responsibility": "Production Head"},
+    {"process": "Finishing", "duration": 0.5, "responsibility": "Sampling Head"},
+    {"process": "Packing", "duration": 1, "responsibility": "Sampling Head"},
+    {"process": "Documentation in PLM", "duration": 0.5, "responsibility": "Sampling Head"},
     {"process": "Dispatch", "duration": 0.5, "responsibility": "Merchandiser"},
 ]
 
@@ -314,9 +326,239 @@ PREDEFINED_PROCESSES = [
 with app.app_context():
     db.create_all()
 
-# ---------------- Authentication Routes ----------------
+
+#Invites
+# Route to create invites (only for admin/authorized users)
+@app.route('/create-invite', methods=['POST'])
+@jwt_required()
+def create_invite():
+    current_user = get_jwt_identity()
+    
+    # Check if current user has permission to create invites
+    user = User.query.get(current_user)
+    role = Role.query.get(user.role_id) if user else None
+    if not user or role.name not in ['admin', 'super_admin']:  # Adjust roles as needed
+        return jsonify({"message": "Unauthorized to create invites"}), 403
+    
+    data = request.get_json()
+    email = data.get('email')
+    role_name = data.get('role', 'user')
+    expires_in_days = data.get('expires_in_days', 7)  # Default 7 days
+    
+    if not email:
+        return jsonify({"message": "Email is required"}), 400
+    
+    # Check if role exists
+    role = Role.query.filter_by(name=role_name).first()
+    if not role:
+        return jsonify({"message": "Invalid role"}), 400
+    
+    # Check if user already exists
+    if User.query.filter_by(username=email).first():
+        return jsonify({"message": "User with this email already exists"}), 400
+    
+    # Check if there's already an unused invite for this email
+    existing_invite = Invite.query.filter_by(email=email, is_used=False).first()
+    if existing_invite and existing_invite.expires_at > datetime.utcnow():
+        return jsonify({"message": "Active invite already exists for this email"}), 400
+    
+    # Generate unique invite hash
+    invite_hash = secrets.token_urlsafe(32)
+    
+    # Create invite
+    invite = Invite(
+        invite_hash=invite_hash,
+        email=email,
+        role_name=role_name,
+        created_by=current_user,
+        expires_at=datetime.utcnow() + timedelta(days=expires_in_days)
+    )
+    
+    db.session.add(invite)
+    db.session.commit()
+    
+    # Log the invite creation
+    log_audit(
+        user_id=current_user,
+        action='CREATE',
+        table_name='Invite',
+        record_id=invite.id,
+        new_values={'email': email, 'role': role_name},
+        ip_address=request.remote_addr
+    )
+    
+    # Generate invite URL
+    invite_url = f"https://samplify.pages.dev/register?invite={invite_hash}"
+    
+    return jsonify({
+        "message": "Invite created successfully",
+        "invite_hash": invite_hash,
+        "invite_url": invite_url,
+        "expires_at": invite.expires_at.isoformat()
+    }), 201
+
+# Route to validate invite
+@app.route('/validate-invite/<invite_hash>', methods=['GET'])
+def validate_invite(invite_hash):
+    invite = Invite.query.filter_by(invite_hash=invite_hash).first()
+    
+    if not invite:
+        return jsonify({"message": "Invalid invite", "valid": False}), 404
+    
+    if invite.is_used:
+        return jsonify({"message": "Invite has already been used", "valid": False}), 400
+    
+    if invite.expires_at < datetime.utcnow():
+        return jsonify({"message": "Invite has expired", "valid": False}), 400
+    
+    return jsonify({
+        "valid": True,
+        "email": invite.email,
+        "role": invite.role_name,
+        "expires_at": invite.expires_at.isoformat()
+    }), 200
+
+# Modified registration route
 @app.route('/register', methods=['POST'])
 def register():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    invite_hash = data.get('invite_hash')
+    
+    if not invite_hash:
+        return jsonify({"message": "Invite hash is required"}), 400
+    
+    # Validate invite
+    invite = Invite.query.filter_by(invite_hash=invite_hash).first()
+    
+    if not invite:
+        return jsonify({"message": "Invalid invite"}), 400
+    
+    if invite.is_used:
+        return jsonify({"message": "Invite has already been used"}), 400
+    
+    if invite.expires_at < datetime.utcnow():
+        return jsonify({"message": "Invite has expired"}), 400
+    
+    # Check if the email matches the invite
+    if username != invite.email:
+        return jsonify({"message": "Email must match the invited email"}), 400
+    
+    # Check if user already exists (double check)
+    if User.query.filter_by(username=username).first():
+        return jsonify({"message": "User already exists"}), 400
+    
+    # Get role from invite
+    role = Role.query.filter_by(name=invite.role_name).first()
+    if not role:
+        return jsonify({"message": "Invalid role in invite"}), 400
+    
+    # Create user
+    hashed_password = generate_password_hash(password)
+    new_user = User(
+        username=username,
+        password=hashed_password,
+        role_id=role.id
+    )
+    db.session.add(new_user)
+    
+    # Mark invite as used
+    invite.is_used = True
+    invite.used_at = datetime.utcnow()
+    
+    db.session.commit()
+    
+    # Log the user creation
+    log_audit(
+        user_id=new_user.id,
+        action='CREATE',
+        table_name='User',
+        record_id=new_user.id,
+        new_values={'username': username, 'role': invite.role_name, 'invite_used': invite_hash},
+        ip_address=request.remote_addr
+    )
+    
+    return jsonify({"message": "User registered successfully"}), 201
+
+# Route to list invites (for admin panel)
+@app.route('/invites', methods=['GET'])
+@jwt_required()
+def list_invites():
+    current_user = get_jwt_identity()
+    user = User.query.get(current_user)
+    role = Role.query.get(user.role_id) if user else None
+
+    if not user or role.name not in ['admin', 'super_admin']:
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    
+    invites = Invite.query.order_by(Invite.created_at.desc()).paginate(
+        page=page, per_page=per_page, error_out=False
+    )
+    
+    invite_list = []
+    for invite in invites.items:
+        creator = User.query.get(invite.created_by)
+        invite_list.append({
+            'id': invite.id,
+            'invite_hash': invite.invite_hash,
+            'email': invite.email,
+            'role_name': invite.role_name,
+            'created_by': creator.username if creator else 'Unknown',
+            'created_at': invite.created_at.isoformat(),
+            'expires_at': invite.expires_at.isoformat(),
+            'used_at': invite.used_at.isoformat() if invite.used_at else None,
+            'is_used': invite.is_used,
+            'is_expired': invite.expires_at < datetime.utcnow()
+        })
+    
+    return jsonify({
+        'invites': invite_list,
+        'total': invites.total,
+        'pages': invites.pages,
+        'current_page': page
+    }), 200
+
+# Route to revoke/delete invite
+@app.route('/revoke-invite/<invite_hash>', methods=['DELETE'])
+@jwt_required()
+def revoke_invite(invite_hash):
+    current_user = get_jwt_identity()
+    user = User.query.get(current_user)
+    
+    if not user or user.role.name not in ['admin', 'super_admin']:
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    invite = Invite.query.filter_by(invite_hash=invite_hash).first()
+    
+    if not invite:
+        return jsonify({"message": "Invite not found"}), 404
+    
+    if invite.is_used:
+        return jsonify({"message": "Cannot revoke used invite"}), 400
+    
+    db.session.delete(invite)
+    db.session.commit()
+    
+    # Log the invite revocation
+    log_audit(
+        user_id=current_user,
+        action='DELETE',
+        table_name='Invite',
+        record_id=invite.id,
+        new_values={'email': invite.email, 'revoked': True},
+        ip_address=request.remote_addr
+    )
+    
+    return jsonify({"message": "Invite revoked successfully"}), 200
+
+
+# ---------------- Authentication Routes ----------------
+@app.route('/register_old', methods=['POST'])
+def register_old():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -368,7 +610,7 @@ def login():
     user.last_login = datetime.utcnow()
     db.session.commit()
     role_name = Role.query.get(user.role_id).name if user.role_id else None
-    access_token = create_access_token(identity=user.id)
+    access_token = create_access_token(identity=str(user.id))
     return jsonify({
         "access_token": access_token,
         "role": user.role_id,
