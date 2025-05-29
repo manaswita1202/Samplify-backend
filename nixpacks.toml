@@ -1,5 +1,5 @@
 [start]
-cmd = "gunicorn --workers 1 --worker-class sync --worker-connections 200 --timeout 300 --keep-alive 2 --max-requests 25 --max-requests-jitter 3 --worker-tmp-dir /dev/shm --preload app:app"
+cmd = "gunicorn --workers 2 --worker-class gevent --worker-connections 100 --timeout 300 --keep-alive 2 --max-requests 50 --max-requests-jitter 5 --worker-tmp-dir /dev/shm --preload app:app"
 
 [variables]
 PYTHONUNBUFFERED = "1"
