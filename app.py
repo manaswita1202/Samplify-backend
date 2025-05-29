@@ -15,8 +15,9 @@ import PyPDF2  # For reading PDF files
 import pandas as pd  # For reading Excel files
 from openpyxl import load_workbook  # Alternative for Excel files
 from collections import OrderedDict
-import base64
 from PIL import Image
+import tempfile
+import shutil
 
 app = Flask(__name__)
 
@@ -26,12 +27,12 @@ GEMINI_API_SECRET_KEY = os.environ.get("GEMINI_API_SECRET_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # MySQL Database Configuration (Using SQLAlchemy)
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:UAlSGuBARF9XrZZEDoVDwKKjEXe929f6@shortline.proxy.rlwy.net:36614/railway'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'ashirwad'  # Change this to a secure secret key
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
-genai.configure(api_key=GEMINI_API_SECRET_KEY)
+genai.configure(api_key='AIzaSyDIk1USgXHuTeqbhmbrC7OX3wPmh9LASrE')
 
 
 class CustomJSONEncoder(json.JSONEncoder):
@@ -1426,94 +1427,211 @@ def upload_files():
 
     return jsonify({"message": "Files uploaded successfully!", "files": uploaded_files})
 
+@app.before_request
+def optimize_memory():
+    """Memory optimization before processing large files"""
+    if request.endpoint == 'upload_files_new':
+        import gc
+        gc.collect()  # Force garbage collection before processing
+
 @app.route("/upload_files_new", methods=["POST"])
 def upload_files_new():
-    buyer_name = request.form.get("buyerName")
-    garment = request.form.get("garment")
-    
-    if not buyer_name or not garment:
-        return jsonify({"message": "Buyer Name and Garment are required!"}), 400
-    
+    temp_files = []  # Track temporary files for cleanup
     uploaded_files = {}
-    fileNames = []
-    for file_key in ["techpack", "bom", "specSheet"]:
-        if file_key in request.files:
-            file = request.files[file_key]
-            if file.filename:  # Check if file is actually selected
-                # Add file type indicator in the filename
-                file_path = os.path.join(
-                    app.config["UPLOAD_FOLDER"], 
-                    f"{buyer_name}_{garment}_{file_key}_{file.filename}"
-                )
-                file.save(file_path)
-                uploaded_files[file_key] = file_path
-                fileNames.append(file.filename)
     
-    # If at least Techpack and BOM files were uploaded, create a new Style entry
-    if "techpack" in uploaded_files and "bom" in uploaded_files:
-        # Generate style metadata and techpack data using AI
-        ai_result = generateTechPackDataFromAi(buyer_name,garment,fileNames)
-        style_metadata = ai_result.get("style_metadata", {})
-        techpack_data = ai_result.get("techpack_data", {})
+    try:
+        # Get form data with error handling
+        buyer_name = request.form.get("buyerName")
+        garment = request.form.get("garment")
         
-        # Create new style with the AI-generated data
-        # Use AI-extracted values with fallbacks to form values or defaults
-        new_style = Style(
-            style_number=style_metadata.get("style_number") or "EBOLT-S-05",
-            brand=style_metadata.get("brand") or buyer_name,
-            sample_type=style_metadata.get("sample_type") or "Fit Sample",
-            garment=style_metadata.get("garment") or garment,
-            color=style_metadata.get("color") or techpack_data.get("shade") or "Ivory",
-            quantity=style_metadata.get("quantity") or "2",
-            smv=style_metadata.get("smv") or "42",
-            order_received_date=datetime.today(),
-            techpack_data=techpack_data
-        )
+        if not buyer_name or not garment:
+            return jsonify({"message": "Buyer Name and Garment are required!"}), 400
         
-        db.session.add(new_style)
-        db.session.commit()
-        sample_tracking_sample = SampleTrackerStyle.query.filter_by(style_number=style_metadata.get("style_number")).first()
-
-        if not sample_tracking_sample:
-            new_sample_style = SampleTrackerStyle(
-                style_number=style_metadata.get("style_number"),
-                brand=style_metadata.get("brand"),
-                garment_type=style_metadata.get("garment"),
-                start_date=datetime.now(timezone.utc) # Set start date on creation
-            )
-            db.session.add(new_sample_style)
-            db.session.flush()  # Flush to get the new_style.id for linking samples
-
-            # Add predefined samples to this new style
-            for sample_type_name in PREDEFINED_SAMPLE_TYPES:
-                sample = SampleTrackerSample(
-                    style_id=new_sample_style.id,
-                    type=sample_type_name,
-                    completed=False
-                    # start_date and end_date will be null initially
+        # Validate input lengths
+        if len(buyer_name) > 100 or len(garment) > 100:
+            return jsonify({"message": "Buyer Name and Garment must be less than 100 characters"}), 400
+        
+        fileNames = []
+        
+        # Process files with memory-efficient streaming
+        for file_key in ["techpack", "bom", "specSheet"]:
+            if file_key in request.files:
+                file = request.files[file_key]
+                
+                if file.filename and file.filename.strip():
+                    # Validate filename
+                    if len(file.filename) > 255:
+                        raise ValueError(f"Filename too long: {file.filename}")
+                    
+                    # Sanitize filename to prevent path traversal
+                    safe_filename = "".join(c for c in file.filename if c.isalnum() or c in (' ', '.', '_', '-')).rstrip()
+                    if not safe_filename:
+                        safe_filename = f"file_{file_key}"
+                    
+                    # Create temporary file first
+                    temp_fd, temp_path = tempfile.mkstemp(
+                        suffix=f"_{file_key}",
+                        dir=app.config['UPLOAD_FOLDER']
+                    )
+                    temp_files.append(temp_path)
+                    
+                    try:
+                        # Stream file to temporary location in small chunks for large files
+                        with os.fdopen(temp_fd, 'wb') as temp_file:
+                            file_size = 0
+                            chunk_size = 32 * 1024  # Smaller 32KB chunks for larger files
+                            chunks_processed = 0
+                            
+                            while True:
+                                chunk = file.stream.read(chunk_size)
+                                if not chunk:
+                                    break
+                                
+                                file_size += len(chunk)
+                                chunks_processed += 1
+                                
+                                # Periodic garbage collection for large files
+                                if chunks_processed % 50 == 0:  # Every ~1.6MB
+                                    import gc
+                                    gc.collect()
+                                
+                                temp_file.write(chunk)
+                                
+                                # Optional: Log progress for very large files
+                                if file_size > 2 * 1024 * 1024 and chunks_processed % 100 == 0:
+                                    print(f"Processing {file_key}: {file_size / (1024*1024):.1f}MB processed")
+                        
+                        # Create final file path
+                        final_filename = f"{buyer_name}_{garment}_{file_key}_{safe_filename}"
+                        file_path = os.path.join(app.config["UPLOAD_FOLDER"], final_filename)
+                        
+                        # Move from temp to final location
+                        shutil.move(temp_path, file_path)
+                        temp_files.remove(temp_path)  # Remove from temp tracking since it's moved
+                        
+                        uploaded_files[file_key] = file_path
+                        fileNames.append(safe_filename)
+                        
+                    except Exception as e:
+                        # Clean up temp file if still exists
+                        if temp_path in temp_files:
+                            try:
+                                os.close(temp_fd)
+                            except:
+                                pass
+                            try:
+                                os.unlink(temp_path)
+                            except:
+                                pass
+                        raise e
+        
+        # Check if we have minimum required files
+        if not uploaded_files:
+            return jsonify({"message": "No valid files were uploaded"}), 400
+        
+        # Process AI and database operations only if we have required files
+        if "techpack" in uploaded_files and "bom" in uploaded_files:
+            try:
+                # Force garbage collection before memory-intensive AI processing
+                import gc
+                gc.collect()
+                
+                # Generate style metadata and techpack data using AI
+                # This is your memory-intensive operation, so we do it after file handling
+                ai_result = generateTechPackDataFromAi(buyer_name, garment, fileNames)
+                style_metadata = ai_result.get("style_metadata", {})
+                techpack_data = ai_result.get("techpack_data", {})
+                
+                # Create new style with the AI-generated data
+                new_style = Style(
+                    style_number=style_metadata.get("style_number") or "EBOLT-S-05",
+                    brand=style_metadata.get("brand") or buyer_name,
+                    sample_type=style_metadata.get("sample_type") or "Fit Sample",
+                    garment=style_metadata.get("garment") or garment,
+                    color=style_metadata.get("color") or techpack_data.get("shade") or "Ivory",
+                    quantity=style_metadata.get("quantity") or "2",
+                    smv=style_metadata.get("smv") or "42",
+                    order_received_date=datetime.today(),
+                    techpack_data=techpack_data
                 )
-                db.session.add(sample)
+                
+                db.session.add(new_style)
+                db.session.commit()
+                
+                # Handle sample tracking
+                sample_tracking_sample = SampleTrackerStyle.query.filter_by(
+                    style_number=style_metadata.get("style_number")
+                ).first()
 
-            db.session.commit()
+                if not sample_tracking_sample:
+                    new_sample_style = SampleTrackerStyle(
+                        style_number=style_metadata.get("style_number"),
+                        brand=style_metadata.get("brand"),
+                        garment_type=style_metadata.get("garment"),
+                        start_date=datetime.now(timezone.utc)
+                    )
+                    db.session.add(new_sample_style)
+                    db.session.flush()
 
-        
+                    # Add predefined samples to this new style
+                    for sample_type_name in PREDEFINED_SAMPLE_TYPES:
+                        sample = SampleTrackerSample(
+                            style_id=new_sample_style.id,
+                            type=sample_type_name,
+                            completed=False
+                        )
+                        db.session.add(sample)
+
+                    db.session.commit()
+                
+                # Clean up memory after database operations
+                import gc
+                gc.collect()
+                
+                return jsonify({
+                    "message": "Files uploaded and style created successfully!",
+                    "files": {k: os.path.basename(v) for k, v in uploaded_files.items()},  # Don't expose full paths
+                    "style": {
+                        "id": new_style.id,
+                        "style_number": new_style.style_number,
+                        "brand": new_style.brand,
+                        "garment": new_style.garment,
+                        "color": new_style.color
+                    }
+                })
+                
+            except Exception as ai_error:
+                # If AI processing fails, still return success for file upload
+                return jsonify({
+                    "message": "Files uploaded successfully! Style creation failed - please try again.",
+                    "files": {k: os.path.basename(v) for k, v in uploaded_files.items()},
+                    "error": str(ai_error)
+                }), 202  # Accepted but not fully processed
         
         return jsonify({
-            "message": "Files uploaded and style created successfully!",
-            "files": uploaded_files,
-            "style": {
-                "id": new_style.id,
-                "style_number": new_style.style_number,
-                "brand": new_style.brand,
-                "garment": new_style.garment,
-                "color": new_style.color
-            }
+            "message": "Files uploaded successfully! No style created (requires techpack and BOM).", 
+            "files": {k: os.path.basename(v) for k, v in uploaded_files.items()}
         })
     
-    return jsonify({
-        "message": "Files uploaded successfully! No style created (requires techpack and BOM).", 
-        "files": uploaded_files
-    })
+    except ValueError as ve:
+        # Clean up any uploaded files on validation error
+        cleanup_files(list(uploaded_files.values()) + temp_files)
+        return jsonify({"message": str(ve)}), 400
+    
+    except Exception as e:
+        # Clean up any uploaded files on unexpected error
+        cleanup_files(list(uploaded_files.values()) + temp_files)
+        return jsonify({"message": f"Upload failed: {str(e)}"}), 500
+
+def cleanup_files(file_paths):
+    """Helper function to clean up files"""
+    for file_path in file_paths:
+        try:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+        except Exception:
+            pass  # Ignore cleanup errors
+
 
 def generateTechPackData():
          new_techpack_data = {

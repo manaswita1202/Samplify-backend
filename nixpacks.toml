@@ -1,2 +1,12 @@
 [start]
-cmd = "gunicorn app:app"
+cmd = "gunicorn --workers 1 --worker-class sync --worker-connections 200 --timeout 300 --keep-alive 2 --max-requests 25 --max-requests-jitter 3 --worker-tmp-dir /dev/shm --preload app:app"
+
+[variables]
+PYTHONUNBUFFERED = "1"
+FLASK_ENV = "production"
+WERKZEUG_RUN_MAIN = "true"
+# Memory optimization for larger files
+MALLOC_TRIM_THRESHOLD_ = "50000"
+MALLOC_MMAP_THRESHOLD_ = "65536"
+# Force garbage collection more frequently
+PYTHONMALLOC = "malloc"
