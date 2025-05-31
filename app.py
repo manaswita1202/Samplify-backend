@@ -27,12 +27,12 @@ GEMINI_API_SECRET_KEY = os.environ.get("GEMINI_API_SECRET_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # MySQL Database Configuration (Using SQLAlchemy)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:UAlSGuBARF9XrZZEDoVDwKKjEXe929f6@shortline.proxy.rlwy.net:36614/railway'
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'ashirwad'  # Change this to a secure secret key
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
-genai.configure(api_key='AIzaSyDIk1USgXHuTeqbhmbrC7OX3wPmh9LASrE')
+genai.configure(api_key=GEMINI_API_SECRET_KEY)
 
 
 class CustomJSONEncoder(json.JSONEncoder):
