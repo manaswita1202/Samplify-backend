@@ -2198,7 +2198,7 @@ def generateTechPackDataFromAi(buyer_name,garment,fileNames):
     
     try:
         # Generate response using Gemini
-        model = genai.GenerativeModel("gemini-2.0-flash") # Ensure genai is imported and configured
+        model = genai.GenerativeModel("gemini-2.5-pro-preview-05-06") # Ensure genai is imported and configured
         response = model.generate_content(formatted_prompt)
         response_text = response.text.strip().removeprefix("```json").removesuffix('```')
         app.logger.info(response_text)
@@ -2595,9 +2595,15 @@ def chatbot_query():
     return jsonify({"response": response})
 
 def get_style_data_for_gemini(user_query):
+    all_styles = [style.style_number for style in Style.query.all()]
+    prompt = f"""
+    Here is a list of style numbers: {', '.join(all_styles)}.
+    Given the input query "{user_query}", find the closest matching style number from the list.
+    Respond with only the closest matching style number.
+    """
+    resp = query_gemini(prompt).strip()
     style_no = user_query.split()[-1]  # Extract style number
-    style_info = Style.query.filter_by(style_number=style_no).first()
-    
+    style_info = Style.query.filter_by(style_number=resp).first()
     # Convert style data to dictionary with date handling
     style_data = {}
     if style_info:
@@ -2677,7 +2683,7 @@ def analyze_image():
         if pil_image.mode != 'RGB':
             pil_image = pil_image.convert('RGB')
 
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-pro-preview-05-06")
 
         # Analysis prompt
         analysis_prompt = """
@@ -2699,7 +2705,49 @@ Analyze the garment in this image and provide your assessment in the following s
     "Solid": 0,
     "Floral": 0,
     "zigzag": 0,
-    "chevron": 0
+    "chevron": 0,
+      "Argyle": 0,
+  "Checkerboard": 0,
+  "Glen Plaid": 0,
+  "Tartan Plaid": 0,
+  "Shepherd’s Check": 0,
+  "Mini Check": 0,
+  "Buffalo Check": 0,
+  "Gingham Checks": 0,
+  "Graph Checks": 0,
+  "Grid Patterns": 0,
+  "Mullion": 0,
+  "Brick Rubiana": 0,
+  "Slocomb": 0,
+  "Floral": 0,
+  "Ditsy": 0,
+  "Tropical": 0,
+  "Palmette": 0,
+  "Acanthus": 0,
+  "Provencal": 0,
+  "Peacock": 0,
+  "Paisley": 0,
+  "Hawaiian": 0,
+  "Leopard Print": 0,
+  "Cow Print": 0,
+  "Zebra Stripes": 0,
+  "Snake Skin": 0,
+  "Tiger Stripes": 0,
+  "Chevron": 0,
+  "Ogee Pattern": 0,
+  "Harlequin Prints": 0,
+  "Illusion": 0,
+  "Diamond": 0,
+  "Mandala": 0,
+  "Warli": 0,
+  "Cable": 0,
+  "Double Herringbone": 0,
+  "Far Isle": 0,
+  "Birdseye": 0,
+  "Comic Character Prints": 0,
+  "Polka Dots": 0,
+  "Stripes (Horizontal/Vertical)": 0
+
   },
   "colorDistribution": [
     {
@@ -2749,20 +2797,56 @@ a {analysis_result['garmentType']} in the following JSON format:
     "Oversized": 0
   }},
   "patternDistribution": {{
-    "Argyle": 0,
-    "Checkerboard": 0,
-    "Plaid": 0,
-    "Gingham": 0,
-    "Floral": 0,
-    "Animal": 0,
-    "Stripes": 0,
-    "Solid": 0
+  "Argyle": 0,
+  "Checkerboard": 0,
+  "Glen Plaid": 0,
+  "Tartan Plaid": 0,
+  "Shepherd’s Check": 0,
+  "Mini Check": 0,
+  "Buffalo Check": 0,
+  "Gingham Checks": 0,
+  "Graph Checks": 0,
+  "Grid Patterns": 0,
+  "Mullion": 0,
+  "Brick Rubiana": 0,
+  "Slocomb": 0,
+  "Floral": 0,
+  "Ditsy": 0,
+  "Tropical": 0,
+  "Palmette": 0,
+  "Acanthus": 0,
+  "Provencal": 0,
+  "Peacock": 0,
+  "Paisley": 0,
+  "Hawaiian": 0,
+  "Leopard Print": 0,
+  "Cow Print": 0,
+  "Zebra Stripes": 0,
+  "Snake Skin": 0,
+  "Tiger Stripes": 0,
+  "Chevron": 0,
+  "Ogee Pattern": 0,
+  "Harlequin Prints": 0,
+  "Illusion": 0,
+  "Diamond": 0,
+  "Mandala": 0,
+  "Warli": 0,
+  "Cable": 0,
+  "Double Herringbone": 0,
+  "Far Isle": 0,
+  "Birdseye": 0,
+  "Comic Character Prints": 0,
+  "Polka Dots": 0,
+  "Stripes (Horizontal/Vertical)": 0
   }},
   "fabricDistribution": {{
     "Waffle Knit": 0,
     "Pique Knit": 0,
-    "French Terry": 0,
-    "Jacquard": 0
+    "Crochet": 0,
+    "Honeycomb": 0,
+    "Pique Knit": 0, 
+    "Pointelle": 0, 
+    "Herringbone" : 0
   }},
   "colorDistribution": [
     {{
@@ -2773,8 +2857,8 @@ a {analysis_result['garmentType']} in the following JSON format:
 }}
 
 Each distribution should represent the percentage trends for 2025, with values adding up to 100 in each category. 
-For colorDistribution, use Pantone shades with their respective percentages.
-
+For colorDistribution, use Pantone shades with their respective percentages, match top 5 closest colors.
+For patternDistribution approximate it with top 5 closest patterns to the garment type.
 Provide only the JSON response with no additional text.
         """
 
